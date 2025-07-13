@@ -1,32 +1,44 @@
 use crate::am_handler_port::{new_table_am_routine, TableAmArgs, TableAmHandler, TableAmRoutine};
+use crate::scan::*;
 use pg_sys::{
-    palloc, BlockNumber, BufferAccessStrategy, BufferAccessStrategyData, BulkInsertStateData,
-    CommandId, ForkNumber, HeapScanDesc, HeapScanDescData, IndexBuildCallback, IndexFetchTableData,
-    IndexInfo, InvalidBuffer, ItemPointer, LockTupleMode, LockWaitPolicy, MultiXactId, Oid,
-    ParallelBlockTableScanWorkerData, ParallelTableScanDesc, ParallelTableScanDescData, ReadStream,
-    RelFileLocator, Relation, RelationData, RelationIncrementReferenceCount, SampleScanState,
-    ScanDirection, ScanKey, ScanKeyData, Snapshot, SnapshotData, TM_FailureData, TM_IndexDeleteOp,
-    TM_Result, TTSOpsBufferHeapTuple, TU_UpdateIndexes, TableScanDesc, TransactionId,
-    TupleTableSlot, TupleTableSlotOps, VacuumParams, ValidateIndexState,
+    palloc, read_stream_begin_relation, BlockNumber, BufferAccessStrategy,
+    BufferAccessStrategyData, BulkInsertStateData, CommandId, ForkNumber, HeapScanDesc,
+    HeapScanDescData, IndexBuildCallback, IndexFetchTableData, IndexInfo, InvalidBuffer,
+    ItemPointer, LockTupleMode, LockWaitPolicy, MultiXactId, NBuffers, Oid,
+    ParallelBlockTableScanDesc, ParallelBlockTableScanDescData, ParallelBlockTableScanWorkerData,
+    ParallelTableScanDesc, ParallelTableScanDescData, ReadStream, RelFileLocator, Relation,
+    RelationData, RelationGetNumberOfBlocksInFork, RelationIncrementReferenceCount,
+    SampleScanState, ScanDirection, ScanKey, ScanKeyData, Snapshot, SnapshotData, TM_FailureData,
+    TM_IndexDeleteOp, TM_Result, TTSOpsBufferHeapTuple, TU_UpdateIndexes, TableScanDesc,
+    TransactionId, TupleTableSlot, TupleTableSlotOps, VacuumParams, ValidateIndexState,
 };
+use pgrx::pg_sys::BufferAccessStrategyType::BAS_BULKREAD;
+use pgrx::pg_sys::ScanDirection::ForwardScanDirection;
+use pgrx::pg_sys::ScanOptions::SO_ALLOW_SYNC;
+use pgrx::pg_sys::{synchronize_seqscans, FreeAccessStrategy, GetAccessStrategy, InvalidBlockNumber};
 use pgrx::{
     pg_sys::{
-        read_stream_begin_relation,
         ForkNumber::MAIN_FORKNUM,
         ReadStreamBlockNumberCB,
         ScanOptions::{SO_ALLOW_PAGEMODE, SO_ALLOW_STRAT, SO_TYPE_SAMPLESCAN, SO_TYPE_SEQSCAN},
         SnapshotType::{SNAPSHOT_HISTORIC_MVCC, SNAPSHOT_MVCC},
-        READ_STREAM_SEQUENTIAL,
+        READ_STREAM_SEQUENTIAL, RELPERSISTENCE_TEMP,
     },
     prelude::*,
 };
-use crate::scan::*;
 
 #[macro_export]
 macro_rules! IsMVCCSnapshot {
     ($snapshot:expr) => {
         (*$snapshot).snapshot_type == SNAPSHOT_MVCC
             || (*$snapshot).snapshot_type == SNAPSHOT_HISTORIC_MVCC
+    };
+}
+
+#[macro_export]
+macro_rules! RelationUsesLocalBuffers {
+    ($relation:expr) => {
+        (*((*$relation).rd_rel)).relpersistence == RELPERSISTENCE_TEMP as i8
     };
 }
 
@@ -48,6 +60,75 @@ unsafe extern "C-unwind" fn initscan(
     key: *mut ScanKeyData,
     keep_start_block: bool,
 ) {
+    let mut bpscan: ParallelBlockTableScanDesc = std::ptr::null_mut();
+    // Determine the number of blocks we need to scan
+    if (*scan).rs_base.rs_parallel.is_null() {
+        (*scan).rs_nblocks = RelationGetNumberOfBlocksInFork((*scan).rs_base.rs_rd, MAIN_FORKNUM);
+    } else {
+        bpscan = (*scan).rs_base.rs_parallel as ParallelBlockTableScanDesc;
+        (*scan).rs_nblocks = (*bpscan).phs_nblocks;
+    }
+
+    let (allow_strat, allow_sync) = if !RelationUsesLocalBuffers!((*scan).rs_base.rs_rd)
+        && (*scan).rs_nblocks > (NBuffers as u32 / 4)
+    {
+        (
+            ((*scan).rs_base.rs_flags & SO_ALLOW_STRAT) != 0,
+            ((*scan).rs_base.rs_flags & SO_ALLOW_SYNC) != 0,
+        )
+    } else {
+        (false, false)
+    };
+
+    if allow_strat {
+        if (*scan).rs_strategy.is_null() {
+            (*scan).rs_strategy = GetAccessStrategy(BAS_BULKREAD);
+        }
+    } else {
+        if !(*scan).rs_strategy.is_null() {
+            FreeAccessStrategy((*scan).rs_strategy);
+        }
+        (*scan).rs_strategy = std::ptr::null_mut();
+    }
+
+    if !(*scan).rs_base.rs_parallel.is_null() {
+        if (*((*scan).rs_base.rs_parallel)).phs_syncscan {
+            (*scan).rs_base.rs_flags |= SO_ALLOW_SYNC;
+        } else {
+            (*scan).rs_base.rs_flags &= !SO_ALLOW_SYNC;
+        }
+    } else if keep_start_block {
+        if allow_sync && synchronize_seqscans {
+            (*scan).rs_base.rs_flags |= SO_ALLOW_SYNC;
+        } else {
+            (*scan).rs_base.rs_flags &= !SO_ALLOW_SYNC;
+        }
+    } 
+    // else if allow_sync && synchronize_seqscans {
+        
+    // }
+    
+    else {
+        (*scan).rs_base.rs_flags &= !SO_ALLOW_SYNC;
+        (*scan).rs_startblock = 0;
+    }
+
+    (*scan).rs_numblocks = InvalidBlockNumber;
+    (*scan).rs_inited = false;
+    (*scan).rs_ctup.t_data = std::ptr::null_mut();
+    // TODO: init ctup-> tself
+    (*scan).rs_cbuf = InvalidBuffer as i32;
+    (*scan).rs_cblock = InvalidBlockNumber;
+    (*scan).rs_ntuples = 0;
+    (*scan).rs_cindex = 0;
+    (*scan).rs_dir = ForwardScanDirection;
+    (*scan).rs_prefetch_block = InvalidBlockNumber;
+
+    if !key.is_null() && (*scan).rs_base.rs_nkeys > 0{
+        (*scan).rs_base.rs_key.copy_from(key, (*scan).rs_base.rs_nkeys as usize);
+    }
+
+
 }
 
 #[pg_guard]
@@ -70,7 +151,6 @@ unsafe extern "C-unwind" fn scan_begin(
     (*scan).rs_base.rs_parallel = pscan;
     (*scan).rs_strategy = std::ptr::null_mut();
     (*scan).rs_cbuf = InvalidBuffer as i32;
-
     (*scan).rs_ctup.t_tableOid = (*rel).rd_id;
 
     // if snapshot.is_null()
@@ -92,6 +172,8 @@ unsafe extern "C-unwind" fn scan_begin(
         (*scan).rs_parallelworkerdata = std::ptr::null_mut();
     }
 
+    // we do this here instead of in initscan() because heap_rescan also calls
+    // initscan() and we don't want to allocate memory again
     if nkeys > 0 {
         (*scan).rs_base.rs_key = palloc(std::mem::size_of::<ScanKeyData>()) as ScanKey;
     } else {
