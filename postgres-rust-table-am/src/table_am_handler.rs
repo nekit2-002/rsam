@@ -15,7 +15,10 @@ use pg_sys::{
 use pgrx::pg_sys::BufferAccessStrategyType::BAS_BULKREAD;
 use pgrx::pg_sys::ScanDirection::ForwardScanDirection;
 use pgrx::pg_sys::ScanOptions::SO_ALLOW_SYNC;
-use pgrx::pg_sys::{synchronize_seqscans, FreeAccessStrategy, GetAccessStrategy, InvalidBlockNumber};
+use pgrx::pg_sys::{
+    synchronize_seqscans, FreeAccessStrategy, GetAccessStrategy, InvalidBlockNumber,
+    ItemPointerSetInvalid,
+};
 use pgrx::{
     pg_sys::{
         ForkNumber::MAIN_FORKNUM,
@@ -60,12 +63,11 @@ unsafe extern "C-unwind" fn initscan(
     key: *mut ScanKeyData,
     keep_start_block: bool,
 ) {
-    let mut bpscan: ParallelBlockTableScanDesc = std::ptr::null_mut();
     // Determine the number of blocks we need to scan
     if (*scan).rs_base.rs_parallel.is_null() {
         (*scan).rs_nblocks = RelationGetNumberOfBlocksInFork((*scan).rs_base.rs_rd, MAIN_FORKNUM);
     } else {
-        bpscan = (*scan).rs_base.rs_parallel as ParallelBlockTableScanDesc;
+        let bpscan = (*scan).rs_base.rs_parallel as ParallelBlockTableScanDesc;
         (*scan).rs_nblocks = (*bpscan).phs_nblocks;
     }
 
@@ -92,7 +94,7 @@ unsafe extern "C-unwind" fn initscan(
     }
 
     if !(*scan).rs_base.rs_parallel.is_null() {
-        if (*((*scan).rs_base.rs_parallel)).phs_syncscan {
+        if (*(*scan).rs_base.rs_parallel).phs_syncscan {
             (*scan).rs_base.rs_flags |= SO_ALLOW_SYNC;
         } else {
             (*scan).rs_base.rs_flags &= !SO_ALLOW_SYNC;
@@ -103,11 +105,10 @@ unsafe extern "C-unwind" fn initscan(
         } else {
             (*scan).rs_base.rs_flags &= !SO_ALLOW_SYNC;
         }
-    } 
+    }
     // else if allow_sync && synchronize_seqscans {
-        
+
     // }
-    
     else {
         (*scan).rs_base.rs_flags &= !SO_ALLOW_SYNC;
         (*scan).rs_startblock = 0;
@@ -116,7 +117,7 @@ unsafe extern "C-unwind" fn initscan(
     (*scan).rs_numblocks = InvalidBlockNumber;
     (*scan).rs_inited = false;
     (*scan).rs_ctup.t_data = std::ptr::null_mut();
-    // TODO: init ctup-> tself
+    ItemPointerSetInvalid(&raw mut (*scan).rs_ctup.t_self);
     (*scan).rs_cbuf = InvalidBuffer as i32;
     (*scan).rs_cblock = InvalidBlockNumber;
     (*scan).rs_ntuples = 0;
@@ -124,11 +125,16 @@ unsafe extern "C-unwind" fn initscan(
     (*scan).rs_dir = ForwardScanDirection;
     (*scan).rs_prefetch_block = InvalidBlockNumber;
 
-    if !key.is_null() && (*scan).rs_base.rs_nkeys > 0{
-        (*scan).rs_base.rs_key.copy_from(key, (*scan).rs_base.rs_nkeys as usize);
+    if !key.is_null() && (*scan).rs_base.rs_nkeys > 0 {
+        (*scan)
+            .rs_base
+            .rs_key
+            .copy_from(key, (*scan).rs_base.rs_nkeys as usize);
     }
 
-
+    if ((*scan).rs_base.rs_flags & SO_TYPE_SEQSCAN) != 0 {
+        pgstat_count_heap_scan((*scan).rs_base.rs_rd);
+    }
 }
 
 #[pg_guard]
@@ -164,28 +170,26 @@ unsafe extern "C-unwind" fn scan_begin(
 
     // }
 
-    if !pscan.is_null() {
-        (*scan).rs_parallelworkerdata =
-            palloc(std::mem::size_of::<ParallelBlockTableScanWorkerData>())
-                as *mut ParallelBlockTableScanWorkerData;
+    (*scan).rs_parallelworkerdata = if !pscan.is_null() {
+        palloc(std::mem::size_of::<ParallelBlockTableScanWorkerData>())
+            as *mut ParallelBlockTableScanWorkerData
     } else {
-        (*scan).rs_parallelworkerdata = std::ptr::null_mut();
-    }
+        std::ptr::null_mut()
+    };
 
     // we do this here instead of in initscan() because heap_rescan also calls
     // initscan() and we don't want to allocate memory again
-    if nkeys > 0 {
-        (*scan).rs_base.rs_key = palloc(std::mem::size_of::<ScanKeyData>()) as ScanKey;
+    (*scan).rs_base.rs_key = if nkeys > 0 {
+        palloc(std::mem::size_of::<ScanKeyData>()) as ScanKey
     } else {
-        (*scan).rs_base.rs_key = std::ptr::null_mut();
-    }
+        std::ptr::null_mut()
+    };
 
     initscan(scan, key, false);
 
-    (*scan).rs_read_stream = std::ptr::null_mut();
-    if (*scan).rs_base.rs_flags & SO_TYPE_SEQSCAN != 0 {
+    (*scan).rs_read_stream = if (*scan).rs_base.rs_flags & SO_TYPE_SEQSCAN != 0 {
         let cb: ReadStreamBlockNumberCB = Some(heap_scan_stream_read_next_serial);
-        (*scan).rs_read_stream = read_stream_begin_relation(
+        read_stream_begin_relation(
             READ_STREAM_SEQUENTIAL as i32,
             (*scan).rs_strategy,
             (*scan).rs_base.rs_rd,
@@ -194,7 +198,9 @@ unsafe extern "C-unwind" fn scan_begin(
             scan as *mut core::ffi::c_void,
             0,
         )
-    }
+    } else {
+        std::ptr::null_mut()
+    };
 
     scan as TableScanDesc
 }
