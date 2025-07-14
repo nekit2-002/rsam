@@ -1,13 +1,13 @@
 use crate::am_handler_port::{new_table_am_routine, TableAmArgs, TableAmHandler, TableAmRoutine};
 use crate::scan::*;
 use pg_sys::{
-    palloc, read_stream_begin_relation, BlockNumber, BufferAccessStrategy,
-    BufferAccessStrategyData, BulkInsertStateData, CommandId, ForkNumber, HeapScanDesc,
-    HeapScanDescData, IndexBuildCallback, IndexFetchTableData, IndexInfo, InvalidBuffer,
-    ItemPointer, LockTupleMode, LockWaitPolicy, MultiXactId, NBuffers, Oid,
+    palloc, read_stream_begin_relation, read_stream_end, read_stream_reset, BlockNumber,
+    BufferAccessStrategy, BufferAccessStrategyData, BufferIsValid, BulkInsertStateData, CommandId,
+    ForkNumber, HeapScanDesc, HeapScanDescData, IndexBuildCallback, IndexFetchTableData, IndexInfo,
+    InvalidBuffer, ItemPointer, LockTupleMode, LockWaitPolicy, MultiXactId, NBuffers, Oid,
     ParallelBlockTableScanDesc, ParallelBlockTableScanDescData, ParallelBlockTableScanWorkerData,
     ParallelTableScanDesc, ParallelTableScanDescData, ReadStream, RelFileLocator, Relation,
-    RelationData, RelationGetNumberOfBlocksInFork, RelationIncrementReferenceCount,
+    RelationData, RelationGetNumberOfBlocksInFork, RelationIncrementReferenceCount, ReleaseBuffer,
     SampleScanState, ScanDirection, ScanKey, ScanKeyData, Snapshot, SnapshotData, TM_FailureData,
     TM_IndexDeleteOp, TM_Result, TTSOpsBufferHeapTuple, TU_UpdateIndexes, TableScanDesc,
     TransactionId, TupleTableSlot, TupleTableSlotOps, VacuumParams, ValidateIndexState,
@@ -16,14 +16,14 @@ use pgrx::pg_sys::BufferAccessStrategyType::BAS_BULKREAD;
 use pgrx::pg_sys::ScanDirection::ForwardScanDirection;
 use pgrx::pg_sys::ScanOptions::SO_ALLOW_SYNC;
 use pgrx::pg_sys::{
-    synchronize_seqscans, FreeAccessStrategy, GetAccessStrategy, InvalidBlockNumber,
-    ItemPointerSetInvalid,
+    pfree, synchronize_seqscans, FreeAccessStrategy, GetAccessStrategy, InvalidBlockNumber,
+    ItemPointerSetInvalid, RelationDecrementReferenceCount,
 };
 use pgrx::{
     pg_sys::{
         ForkNumber::MAIN_FORKNUM,
         ReadStreamBlockNumberCB,
-        ScanOptions::{SO_ALLOW_PAGEMODE, SO_ALLOW_STRAT, SO_TYPE_SAMPLESCAN, SO_TYPE_SEQSCAN},
+        ScanOptions::{SO_ALLOW_PAGEMODE, SO_ALLOW_STRAT, SO_TYPE_SEQSCAN},
         SnapshotType::{SNAPSHOT_HISTORIC_MVCC, SNAPSHOT_MVCC},
         READ_STREAM_SEQUENTIAL, RELPERSISTENCE_TEMP,
     },
@@ -149,7 +149,7 @@ unsafe extern "C-unwind" fn scan_begin(
     RelationIncrementReferenceCount(rel);
 
     // Allocate and initialize scan descriptor
-    let scan: HeapScanDesc = palloc(std::mem::size_of::<HeapScanDescData>()) as HeapScanDesc;
+    let scan = palloc(std::mem::size_of::<HeapScanDescData>()) as HeapScanDesc;
     (*scan).rs_base.rs_rd = rel;
     (*scan).rs_base.rs_snapshot = snapshot;
     (*scan).rs_base.rs_nkeys = nkeys;
@@ -166,13 +166,13 @@ unsafe extern "C-unwind" fn scan_begin(
         (*scan).rs_base.rs_flags &= !SO_ALLOW_PAGEMODE;
     }
 
+    // serializable transaction stuff
     // if (*scan).rs_base.rs_flags & (SO_TYPE_SEQSCAN | SO_TYPE_SAMPLESCAN) != 0 {
 
     // }
 
     (*scan).rs_parallelworkerdata = if !pscan.is_null() {
-        palloc(std::mem::size_of::<ParallelBlockTableScanWorkerData>())
-            as *mut ParallelBlockTableScanWorkerData
+        palloc(std::mem::size_of::<ParallelBlockTableScanWorkerData>()).cast()
     } else {
         std::ptr::null_mut()
     };
@@ -187,39 +187,93 @@ unsafe extern "C-unwind" fn scan_begin(
 
     initscan(scan, key, false);
 
-    (*scan).rs_read_stream = if (*scan).rs_base.rs_flags & SO_TYPE_SEQSCAN != 0 {
+    (*scan).rs_read_stream = std::ptr::null_mut();
+
+    if (*scan).rs_base.rs_flags & SO_TYPE_SEQSCAN != 0 {
         let cb: ReadStreamBlockNumberCB = Some(heap_scan_stream_read_next_serial);
-        read_stream_begin_relation(
+        (*scan).rs_read_stream = read_stream_begin_relation(
             READ_STREAM_SEQUENTIAL as i32,
             (*scan).rs_strategy,
             (*scan).rs_base.rs_rd,
             MAIN_FORKNUM,
             cb,
-            scan as *mut core::ffi::c_void,
+            scan.cast(),
             0,
         )
-    } else {
-        std::ptr::null_mut()
-    };
+    }
 
     scan as TableScanDesc
 }
 
 #[pg_guard]
-unsafe extern "C-unwind" fn scan_end(_desc: TableScanDesc) {
-    todo!("scan_end")
+unsafe extern "C-unwind" fn scan_end(desc: TableScanDesc) {
+    let scan = desc as HeapScanDesc;
+    if BufferIsValid((*scan).rs_cbuf) {
+        ReleaseBuffer((*scan).rs_cbuf);
+    }
+
+    if !(*scan).rs_read_stream.is_null() {
+        read_stream_end((*scan).rs_read_stream);
+    }
+
+    RelationDecrementReferenceCount((*scan).rs_base.rs_rd);
+    if !(*scan).rs_base.rs_key.is_null() {
+        pfree((*scan).rs_base.rs_key.cast());
+    }
+
+    if !(*scan).rs_strategy.is_null() {
+        FreeAccessStrategy((*scan).rs_strategy);
+    }
+
+    if !(*scan).rs_parallelworkerdata.is_null() {
+        pfree((*scan).rs_parallelworkerdata.cast());
+    }
+    pfree(scan.cast())
 }
 
 #[pg_guard]
 unsafe extern "C-unwind" fn scan_rescan(
-    _desc: TableScanDesc,
-    _keys: *mut ScanKeyData,
-    _set_params: bool,
-    _allow_strat: bool,
-    _allow_sync: bool,
-    _allow_pagemode: bool,
+    desc: TableScanDesc,
+    key: *mut ScanKeyData,
+    set_params: bool,
+    allow_strat: bool,
+    allow_sync: bool,
+    allow_pagemode: bool,
 ) {
-    todo!("scan_rescan")
+    let scan = desc as HeapScanDesc;
+    if set_params {
+        if allow_strat {
+            (*scan).rs_base.rs_flags |= SO_ALLOW_STRAT;
+        } else {
+            (*scan).rs_base.rs_flags &= !SO_ALLOW_STRAT;
+        }
+
+        if allow_sync {
+            (*scan).rs_base.rs_flags |= SO_ALLOW_SYNC;
+        } else {
+            (*scan).rs_base.rs_flags &= !SO_ALLOW_SYNC;
+        }
+
+        if allow_pagemode
+            && !(*scan).rs_base.rs_snapshot.is_null()
+            && IsMVCCSnapshot!((*scan).rs_base.rs_snapshot)
+        {
+            (*scan).rs_base.rs_flags |= SO_ALLOW_PAGEMODE;
+        } else {
+            (*scan).rs_base.rs_flags &= !SO_ALLOW_PAGEMODE;
+        }
+    }
+
+    if BufferIsValid((*scan).rs_cbuf) {
+        ReleaseBuffer((*scan).rs_cbuf);
+        (*scan).rs_cbuf = InvalidBuffer as i32;
+    }
+
+    if !(*scan).rs_read_stream.is_null() {
+        read_stream_reset((*scan).rs_read_stream);
+    }
+
+    initscan(scan, key, true);
 }
 
 #[pg_guard]

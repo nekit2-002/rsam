@@ -55,7 +55,7 @@ unsafe extern "C-unwind" fn heapgettup_advance_block(
         }
 
         if scan.rs_numblocks != InvalidBlockNumber {
-            if (*scan_ref.offset(-1)).rs_numblocks == 0 {
+            if (*scan_ref.sub(1)).rs_numblocks == 0 {
                 return InvalidBlockNumber;
             }
         }
@@ -68,7 +68,7 @@ unsafe extern "C-unwind" fn heapgettup_advance_block(
     }
 
     if scan.rs_numblocks != InvalidBlockNumber {
-        if (*scan_ref.offset(-1)).rs_numblocks == 0 {
+        if (*scan_ref.sub(1)).rs_numblocks == 0 {
             return InvalidBlockNumber;
         }
     }
