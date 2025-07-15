@@ -1,4 +1,5 @@
 use crate::am_handler_port::{new_table_am_routine, TableAmArgs, TableAmHandler, TableAmRoutine};
+use crate::insert::*;
 use crate::scan::*;
 use pg_sys::{
     palloc, read_stream_begin_relation, read_stream_end, read_stream_reset, BlockNumber,
@@ -16,8 +17,8 @@ use pgrx::pg_sys::BufferAccessStrategyType::BAS_BULKREAD;
 use pgrx::pg_sys::ScanDirection::ForwardScanDirection;
 use pgrx::pg_sys::ScanOptions::SO_ALLOW_SYNC;
 use pgrx::pg_sys::{
-    pfree, synchronize_seqscans, FreeAccessStrategy, GetAccessStrategy, InvalidBlockNumber,
-    ItemPointerSetInvalid, RelationDecrementReferenceCount,
+    pfree, synchronize_seqscans, ExecFetchSlotHeapTuple, FreeAccessStrategy, GetAccessStrategy,
+    InvalidBlockNumber, ItemPointerCopy, ItemPointerSetInvalid, RelationDecrementReferenceCount,
 };
 use pgrx::{
     pg_sys::{
@@ -372,13 +373,23 @@ unsafe extern "C-unwind" fn index_delete_tuples(
 
 #[pg_guard]
 unsafe extern "C-unwind" fn tuple_insert(
-    _rel: Relation,
-    _slot: *mut TupleTableSlot,
-    _cid: CommandId,
-    _options: ::core::ffi::c_int,
-    _bistate: *mut BulkInsertStateData,
+    rel: Relation,
+    slot: *mut TupleTableSlot,
+    cid: CommandId,
+    options: ::core::ffi::c_int,
+    bistate: *mut BulkInsertStateData,
 ) {
-    todo!("tuple_insert")
+    let mut shouldFree = true;
+    let tuple = ExecFetchSlotHeapTuple(slot, true, &raw mut shouldFree);
+    (*slot).tts_tableOid = (*rel).rd_id;
+    (*tuple).t_tableOid = (*rel).rd_id;
+
+    heap_insert(rel, tuple, cid, options, bistate);
+    ItemPointerCopy(&raw const (*tuple).t_self, &raw mut (*slot).tts_tid);
+
+    if shouldFree {
+        pfree(tuple.cast());
+    }
 }
 
 #[pg_guard]

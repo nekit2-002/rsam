@@ -2,6 +2,7 @@ mod am_handler_port;
 mod slot;
 mod table_am_handler;
 mod scan;
+mod insert;
 
 pgrx::pg_module_magic!();
 
