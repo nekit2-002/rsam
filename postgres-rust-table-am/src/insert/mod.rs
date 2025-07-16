@@ -4,7 +4,8 @@ use pgrx::pg_sys::{
     BufferGetPage, BulkInsertStateData, CommandId, CritSectionCount, GetCurrentTransactionId,
     HeapTuple, HeapTupleData, InvalidBuffer, ItemPointerGetBlockNumber, MarkBufferDirty,
     PageClearAllVisible, PageIsAllVisible, RelationData, ReleaseBuffer, TransactionId,
-    UnlockReleaseBuffer, RELPERSISTENCE_PERMANENT, VISIBILITYMAP_VALID_BITS,
+    UnlockReleaseBuffer, HEAP2_XACT_MASK, HEAP_COMBOCID, HEAP_XACT_MASK, HEAP_XMAX_INVALID,
+    RELPERSISTENCE_PERMANENT, VISIBILITYMAP_VALID_BITS,
 };
 use pgrx::prelude::*;
 
@@ -47,6 +48,7 @@ macro_rules! RelationNeedsWal {
     };
 }
 
+
 #[pg_guard]
 pub unsafe extern "C-unwind" fn heap_prepare_insert(
     rel: *mut RelationData,
@@ -55,7 +57,15 @@ pub unsafe extern "C-unwind" fn heap_prepare_insert(
     cid: CommandId,
     options: i32,
 ) -> HeapTuple {
-    todo!("")
+    (*(*tup).t_data).t_infomask &= !HEAP_XACT_MASK as u16;
+    (*(*tup).t_data).t_infomask2 &= !HEAP2_XACT_MASK as u16;
+    (*(*tup).t_data).t_infomask |= HEAP_XMAX_INVALID as u16;
+    // TODO: set xmin, xmax and cmin
+
+    (*tup).t_tableOid = (*rel).rd_id;
+
+    // TODO: here should be toast stuff
+    tup
 }
 
 #[pg_guard]
@@ -91,6 +101,12 @@ pub unsafe extern "C-unwind" fn heap_insert(
     let xid = GetCurrentTransactionId();
     let mut vmbuffer = InvalidBuffer as i32;
     let mut all_visible_cleared = false;
+
+    /* Fill in tuple header fields and toast the tuple if necessary.
+
+    Note: below this point, heaptup is the data we actually intend to store
+    into the relation; tup is the caller's original untoasted data.
+    */
     let tuple = heap_prepare_insert(rel, tup, xid, cid, options);
     let buffer = RelationGetBufferForTuple(
         rel,
