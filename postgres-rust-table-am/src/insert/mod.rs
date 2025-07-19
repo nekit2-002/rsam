@@ -2,15 +2,18 @@ use pg_sys::WalLevel::WAL_LEVEL_REPLICA;
 use pgrx::pg_sys::ForkNumber::MAIN_FORKNUM;
 use pgrx::pg_sys::{
     pfree, pgstat_count_heap_insert, visibilitymap_clear, visibilitymap_pin, wal_level,
-    BlockNumber, Buffer, BufferGetBlockNumber, BufferGetPage, BulkInsertStateData, CommandId,
-    CritSectionCount, GetCurrentTransactionId, HeapTuple, HeapTupleData, HeapTupleHeader,
-    HeapTupleHeaderData, InvalidBlockNumber, InvalidBuffer, InvalidOffsetNumber, Item, ItemIdData,
-    ItemPointerGetBlockNumber, ItemPointerSet, MarkBufferDirty, PageAddItemExtended,
-    PageClearAllVisible, PageGetItem, PageGetItemId, PageIsAllVisible, ParallelWorkerNumber,
-    RelationData, RelationGetNumberOfBlocksInFork, ReleaseBuffer, SizeOfPageHeaderData,
-    StdRdOptions, TransactionId, UnlockReleaseBuffer, BLCKSZ, HEAP2_XACT_MASK, HEAP_COMBOCID,
-    HEAP_DEFAULT_FILLFACTOR, HEAP_INSERT_SKIP_FSM, HEAP_XACT_MASK, HEAP_XMAX_INVALID, MAXALIGN,
-    PAI_IS_HEAP, PAI_OVERWRITE, RELPERSISTENCE_PERMANENT, VISIBILITYMAP_VALID_BITS, Page
+    BlockNumber, Buffer, BufferGetBlockNumber, BufferGetPage, BufferGetPageSize,
+    BulkInsertStateData, CommandId, CritSectionCount, GetCurrentTransactionId,
+    GetPageWithFreeSpace, HeapTuple, HeapTupleData, HeapTupleHeader, HeapTupleHeaderData,
+    InvalidBlockNumber, InvalidBuffer, InvalidOffsetNumber, Item, ItemIdData,
+    ItemPointerGetBlockNumber, ItemPointerSet, LockBuffer, MarkBufferDirty, Page,
+    PageAddItemExtended, PageClearAllVisible, PageGetHeapFreeSpace, PageGetItem, PageGetItemId,
+    PageInit, PageIsAllVisible, PageIsNew, ParallelWorkerNumber, ReadBuffer,
+    RecordAndGetPageWithFreeSpace, RelationData, RelationGetNumberOfBlocksInFork, RelationGetSmgr,
+    ReleaseBuffer, SizeOfPageHeaderData, StdRdOptions, TransactionId, UnlockReleaseBuffer, BLCKSZ,
+    BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK, HEAP_COMBOCID, HEAP_DEFAULT_FILLFACTOR,
+    HEAP_INSERT_SKIP_FSM, HEAP_XACT_MASK, HEAP_XMAX_INVALID, MAXALIGN, PAI_IS_HEAP, PAI_OVERWRITE,
+    RELPERSISTENCE_PERMANENT, VISIBILITYMAP_VALID_BITS,
 };
 
 // overwrite
@@ -173,7 +176,7 @@ pub unsafe extern "C-unwind" fn prepare_insert(
     tup: *mut HeapTupleData,
     tid: TransactionId,
     cid: CommandId,
-    options: i32,
+    _options: i32,
 ) -> HeapTuple {
     (*(*tup).t_data).t_infomask &= !HEAP_XACT_MASK as u16;
     (*(*tup).t_data).t_infomask2 &= !HEAP2_XACT_MASK as u16;
@@ -200,7 +203,9 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
     mut num_pages: i32,
 ) -> Buffer {
     let len = MAXALIGN(len);
-    let use_fsm: bool = (options & HEAP_INSERT_SKIP_FSM as i32) != 0;
+    // it is safe to init page with null pointer as it is always reinited before being read
+    let mut page: Page = std::ptr::null_mut();
+    let use_fsm: bool = (options & HEAP_INSERT_SKIP_FSM as i32) == 0;
     let mut buffer: Buffer = InvalidBuffer as i32;
     let (mut pageFreeSpace, mut saveFreeSpace, mut targetFreeSpace): (usize, usize, usize) =
         (0, 0, 0);
@@ -209,6 +214,7 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
     }
 
     if len > MaxHeapTupleSize!() {}
+    /* Compute desired extra freespace due to fillfactor option */
     saveFreeSpace = RelationGetTargetPageFreeSpace!(rel, HEAP_DEFAULT_FILLFACTOR as i32);
     let nearlyEmptySpace: usize =
         MaxHeapTupleSize!() - (MaxHeapTuplesPerPage!() / 8 * std::mem::size_of::<ItemIdData>());
@@ -227,8 +233,10 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
 
     // (*(*rel).rd_smgr).smgr_targblock;
     let mut targetBlock = RelationGetTargetBlock!(rel);
-    // TODO: implement this
-    if targetBlock == InvalidBlockNumber && use_fsm {}
+
+    if targetBlock == InvalidBlockNumber && use_fsm {
+        targetBlock = GetPageWithFreeSpace(rel, targetFreeSpace)
+    }
 
     if targetBlock == InvalidBlockNumber {
         let nblocks: BlockNumber = RelationGetNumberOfBlocksInFork(rel, MAIN_FORKNUM);
@@ -237,12 +245,53 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
         }
     }
 
-    'cycle: while targetBlock != InvalidBlockNumber {}
+    while targetBlock != InvalidBlockNumber {
+        if otherBuffer == InvalidBuffer as i32 {
+        } else if otherBlock == targetBlock {
+        } else if otherBlock < targetBlock {
+        } else {
+            buffer = ReadBuffer(rel, targetBlock);
+        }
+
+        // GetVisibilityMapPins(relation, buffer, otherBuffer,
+        //                      targetBlock, otherBlock, vmbuffer,
+        //                      vmbuffer_other);
+        page = BufferGetPage(buffer);
+        if PageIsNew(page) {
+            PageInit(page, BufferGetPageSize(buffer), 0);
+            MarkBufferDirty(buffer);
+        }
+
+        pageFreeSpace = PageGetHeapFreeSpace(page);
+        if targetFreeSpace <= pageFreeSpace {
+            (*RelationGetSmgr(rel)).smgr_targblock = targetBlock;
+            return buffer;
+        }
+
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+        if otherBuffer == InvalidBuffer as i32 {
+            ReleaseBuffer(buffer);
+        } else if otherBlock != targetBlock {
+            LockBuffer(otherBuffer, BUFFER_LOCK_UNLOCK as i32);
+            ReleaseBuffer(buffer);
+        }
+
+        if !use_fsm {
+            break;
+        } else {
+            targetBlock =
+                RecordAndGetPageWithFreeSpace(rel, targetBlock, pageFreeSpace, targetFreeSpace);
+        }
+    }
 
     // buffer = RelationAddBlocks();
     targetBlock = BufferGetBlockNumber(buffer);
-    let page = BufferGetPage(buffer);
+    page = BufferGetPage(buffer);
+    pageFreeSpace = PageGetHeapFreeSpace(page);
+    // TODO: implement this, here must be either error or goto loop statement
+    if len > pageFreeSpace {}
 
+    (*RelationGetSmgr(rel)).smgr_targblock = targetBlock;
     buffer
 }
 
