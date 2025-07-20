@@ -1,9 +1,10 @@
 use pg_sys::WalLevel::WAL_LEVEL_REPLICA;
-use pgrx::pg_sys::ForkNumber::MAIN_FORKNUM;
+use pgrx::pg_sys::ExtendBufferedFlags::EB_LOCK_FIRST;
 use pgrx::pg_sys::{
-    pfree, pgstat_count_heap_insert, visibilitymap_clear, visibilitymap_pin, wal_level,
-    BlockNumber, Buffer, BufferGetBlockNumber, BufferGetPage, BufferGetPageSize,
-    BulkInsertStateData, CommandId, CritSectionCount, GetCurrentTransactionId,
+    pfree, pgstat_count_heap_insert, visibilitymap_clear, visibilitymap_pin, visibilitymap_pin_ok,
+    BlockNumber, Buffer, BufferAccessStrategy, BufferGetBlockNumber, BufferGetPage,
+    BufferGetPageSize, BufferIsValid, BufferManagerRelation, BulkInsertState, BulkInsertStateData,
+    CommandId, ConditionalLockBuffer, CritSectionCount, GetCurrentTransactionId,
     GetPageWithFreeSpace, HeapTuple, HeapTupleData, HeapTupleHeader, HeapTupleHeaderData,
     InvalidBlockNumber, InvalidBuffer, InvalidOffsetNumber, Item, ItemIdData,
     ItemPointerGetBlockNumber, ItemPointerSet, LockBuffer, MarkBufferDirty, Page,
@@ -11,9 +12,14 @@ use pgrx::pg_sys::{
     PageInit, PageIsAllVisible, PageIsNew, ParallelWorkerNumber, ReadBuffer,
     RecordAndGetPageWithFreeSpace, RelationData, RelationGetNumberOfBlocksInFork, RelationGetSmgr,
     ReleaseBuffer, SizeOfPageHeaderData, StdRdOptions, TransactionId, UnlockReleaseBuffer, BLCKSZ,
-    BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK, HEAP_COMBOCID, HEAP_DEFAULT_FILLFACTOR,
-    HEAP_INSERT_SKIP_FSM, HEAP_XACT_MASK, HEAP_XMAX_INVALID, MAXALIGN, PAI_IS_HEAP, PAI_OVERWRITE,
-    RELPERSISTENCE_PERMANENT, VISIBILITYMAP_VALID_BITS,
+    BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK, HEAP_COMBOCID,
+    HEAP_DEFAULT_FILLFACTOR, HEAP_INSERT_FROZEN, HEAP_INSERT_SKIP_FSM, HEAP_XACT_MASK,
+    HEAP_XMAX_INVALID, MAXALIGN, PAI_IS_HEAP, PAI_OVERWRITE, RELPERSISTENCE_PERMANENT,
+    VISIBILITYMAP_VALID_BITS,
+};
+use pgrx::pg_sys::{
+    ForkNumber::*, FreeSpaceMapVacuumRange, RecordPageWithFreeSpace,
+    RelationExtensionLockWaiterCount,
 };
 
 // overwrite
@@ -191,13 +197,171 @@ pub unsafe extern "C-unwind" fn prepare_insert(
 }
 
 #[pg_guard]
+#[allow(non_snake_case)]
+unsafe extern "C-unwind" fn ExtendBufferedRelBy(
+    bmr: BufferManagerRelation,
+    fork: i32,
+    strat: BufferAccessStrategy,
+    flags: u32,
+    extend_by: u32,
+    buffers: *mut Buffer,
+    extended_by: *mut u32,
+) -> BlockNumber {
+    todo!("")
+}
+
+#[pg_guard]
+#[allow(non_snake_case)]
+unsafe extern "C-unwind" fn RelationAddBlocks(
+    rel: *mut RelationData,
+    _state: BulkInsertState,
+    num_pages: i32,
+    use_fsm: bool,
+    did_unlock: *mut bool,
+) -> Buffer {
+    let mut fst_block: BlockNumber = InvalidBlockNumber;
+    let mut last_block: BlockNumber = InvalidBlockNumber;
+    let mut extend_by_pages: u32 = 0;
+    let mut victim_buffers: [Buffer; 64] = [0; 64];
+    let victim_buffers: *mut Buffer = (&mut victim_buffers).as_mut_ptr();
+    if !use_fsm {
+        extend_by_pages = 1;
+    } else {
+        extend_by_pages = num_pages as u32;
+        let waitcount = if (*rel).rd_islocaltemp || (*rel).rd_createSubid != 0 {
+            RelationExtensionLockWaiterCount(rel)
+        } else {
+            0
+        } as u32;
+
+        extend_by_pages += extend_by_pages * waitcount;
+        extend_by_pages = min(extend_by_pages, 64);
+    }
+
+    let not_in_fsm_pages = if num_pages > 1 { 1 } else { num_pages as u32 };
+    fst_block = ExtendBufferedRelBy(
+        BufferManagerRelation {
+            rel: rel,
+            smgr: RelationGetSmgr(rel),
+            relpersistence: (*(*rel).rd_rel).relpersistence,
+        },
+        MAIN_FORKNUM,
+        std::ptr::null_mut(),
+        EB_LOCK_FIRST,
+        extend_by_pages,
+        victim_buffers,
+        &raw mut extend_by_pages,
+    );
+
+    let buffer = *victim_buffers;
+    last_block = fst_block + (extend_by_pages - 1);
+    let page = BufferGetPage(buffer);
+    if !PageIsNew(page) {
+        ereport!(
+            PgLogLevel::ERROR,
+            PgSqlErrorCode::ERRCODE_INTERNAL_ERROR,
+            "new page should be empty but is not!"
+        );
+    }
+
+    PageInit(page, BufferGetPageSize(buffer), 0);
+    MarkBufferDirty(buffer);
+    *did_unlock = if use_fsm && not_in_fsm_pages < extend_by_pages {
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+        true
+    } else {
+        false
+    };
+
+    for i in 1..extend_by_pages {
+        let cur = fst_block + i;
+        ReleaseBuffer(*(victim_buffers.add(i as usize)));
+        if use_fsm && i >= not_in_fsm_pages {
+            let free_space =
+                BufferGetPageSize(*(victim_buffers.add(i as usize))) - SizeOfPageHeaderData();
+            RecordPageWithFreeSpace(rel, cur, free_space);
+        }
+    }
+
+    if use_fsm && not_in_fsm_pages < extend_by_pages {
+        let fst_fsm_block = fst_block + not_in_fsm_pages;
+        FreeSpaceMapVacuumRange(rel, fst_fsm_block, last_block);
+    }
+
+    buffer
+}
+
+#[pg_guard]
+#[allow(non_snake_case)]
+unsafe extern "C-unwind" fn GetVisibilityMapPins(
+    rel: *mut RelationData,
+    mut buffer1: Buffer,
+    mut buffer2: Buffer,
+    mut block1: BlockNumber,
+    mut block2: BlockNumber,
+    mut vmbuffer1: *mut Buffer,
+    mut vmbuffer2: *mut Buffer,
+) -> bool {
+    let mut released_blocks = false;
+    if !BufferIsValid(buffer1) || (BufferIsValid(buffer2) && block1 > block2) {
+        let tmpbuf = buffer1;
+        let tmpvmbuf = vmbuffer1;
+        let tmpblock = block1;
+
+        buffer1 = buffer2;
+        vmbuffer1 = vmbuffer2;
+        block1 = block2;
+        buffer2 = tmpbuf;
+        vmbuffer2 = tmpvmbuf;
+        block2 = tmpblock;
+    }
+
+    loop {
+        let need_to_pin_buffer1 =
+            PageIsAllVisible(BufferGetPage(buffer1)) && !visibilitymap_pin_ok(block1, *vmbuffer1);
+        let need_to_pin_buffer2 = buffer2 != InvalidBuffer as i32
+            && PageIsAllVisible(BufferGetPage(buffer2))
+            && !visibilitymap_pin_ok(block2, *vmbuffer2);
+
+        if !need_to_pin_buffer1 && !need_to_pin_buffer2 {
+            break;
+        }
+
+        released_blocks = true;
+        LockBuffer(buffer1, BUFFER_LOCK_UNLOCK as i32);
+        if buffer2 != InvalidBuffer as i32 && buffer2 != buffer1 {
+            LockBuffer(buffer2, BUFFER_LOCK_UNLOCK as i32);
+        }
+
+        if need_to_pin_buffer1 {
+            visibilitymap_pin(rel, block1, vmbuffer1);
+        }
+        if need_to_pin_buffer2 {
+            visibilitymap_pin(rel, block2, vmbuffer2);
+        }
+
+        LockBuffer(buffer1, BUFFER_LOCK_EXCLUSIVE as i32);
+        if buffer2 != InvalidBuffer as i32 && buffer2 != buffer1 {
+            LockBuffer(buffer2, BUFFER_LOCK_EXCLUSIVE as i32);
+        }
+        if buffer2 == InvalidBuffer as i32
+            || buffer1 == buffer2
+            || (need_to_pin_buffer1 && need_to_pin_buffer2)
+        {
+            break;
+        }
+    }
+    released_blocks
+}
+
+#[pg_guard]
 #[allow(non_snake_case)] // TODO: implement this function
 pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
     rel: *mut RelationData,
     len: usize,
     otherBuffer: Buffer,
     options: i32,
-    state: *mut BulkInsertStateData,
+    _state: *mut BulkInsertStateData,
     vmbuffer: *mut Buffer,
     vmbuffer_other: *mut Buffer,
     mut num_pages: i32,
@@ -213,7 +377,13 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
         num_pages = 1;
     }
 
-    if len > MaxHeapTupleSize!() {}
+    if len > MaxHeapTupleSize!() {
+        ereport!(
+            PgLogLevel::ERROR,
+            PgSqlErrorCode::ERRCODE_PROGRAM_LIMIT_EXCEEDED,
+            "row is too big!"
+        );
+    }
     /* Compute desired extra freespace due to fillfactor option */
     saveFreeSpace = RelationGetTargetPageFreeSpace!(rel, HEAP_DEFAULT_FILLFACTOR as i32);
     let nearlyEmptySpace: usize =
@@ -248,14 +418,36 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
     while targetBlock != InvalidBlockNumber {
         if otherBuffer == InvalidBuffer as i32 {
         } else if otherBlock == targetBlock {
+            buffer = otherBuffer;
+            if PageIsAllVisible(BufferGetPage(buffer)) {
+                visibilitymap_pin(rel, targetBlock, vmbuffer);
+            }
+            LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
         } else if otherBlock < targetBlock {
+            buffer = ReadBuffer(rel, targetBlock);
+            if PageIsAllVisible(BufferGetPage(buffer)) {
+                visibilitymap_pin(rel, targetBlock, vmbuffer);
+            }
+            LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE as i32);
+            LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
         } else {
             buffer = ReadBuffer(rel, targetBlock);
+            if PageIsAllVisible(BufferGetPage(buffer)) {
+                visibilitymap_pin(rel, targetBlock, vmbuffer);
+            }
+            LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
+            LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE as i32);
         }
 
-        // GetVisibilityMapPins(relation, buffer, otherBuffer,
-        //                      targetBlock, otherBlock, vmbuffer,
-        //                      vmbuffer_other);
+        GetVisibilityMapPins(
+            rel,
+            buffer,
+            otherBuffer,
+            targetBlock,
+            otherBlock,
+            vmbuffer,
+            vmbuffer_other,
+        );
         page = BufferGetPage(buffer);
         if PageIsNew(page) {
             PageInit(page, BufferGetPageSize(buffer), 0);
@@ -284,12 +476,71 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
         }
     }
 
-    // buffer = RelationAddBlocks();
+    // Have to extend relation
+    let mut unlockedTargetBuffer = false;
+    buffer = RelationAddBlocks(
+        rel,
+        _state,
+        num_pages,
+        use_fsm,
+        &raw mut unlockedTargetBuffer,
+    );
     targetBlock = BufferGetBlockNumber(buffer);
     page = BufferGetPage(buffer);
     pageFreeSpace = PageGetHeapFreeSpace(page);
+
+    if options & HEAP_INSERT_FROZEN as i32 != 0 {
+        if !visibilitymap_pin_ok(targetBlock, *vmbuffer) {
+            if !unlockedTargetBuffer {
+                LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+            }
+            unlockedTargetBuffer = true;
+            visibilitymap_pin(rel, targetBlock, vmbuffer);
+        }
+    }
+
+    let mut recheckVmPins = false;
+    if unlockedTargetBuffer {
+        if otherBuffer != InvalidBuffer as i32 {
+            LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE as i32);
+        }
+        LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
+        recheckVmPins = true;
+    } else if otherBuffer != InvalidBuffer as i32 {
+        if !ConditionalLockBuffer(otherBuffer) {
+            unlockedTargetBuffer = true;
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+            LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE as i32);
+            LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
+        }
+        recheckVmPins = true;
+    }
+
+    if recheckVmPins {
+        if GetVisibilityMapPins(
+            rel,
+            otherBuffer,
+            buffer,
+            otherBlock,
+            targetBlock,
+            vmbuffer_other,
+            vmbuffer,
+        ) {
+            unlockedTargetBuffer = true;
+        }
+    }
+
+    pageFreeSpace = PageGetHeapFreeSpace(page);
+
     // TODO: implement this, here must be either error or goto loop statement
-    if len > pageFreeSpace {}
+    if len > pageFreeSpace {
+        if unlockedTargetBuffer {}
+        ereport!(
+            PgLogLevel::PANIC,
+            PgSqlErrorCode::ERRCODE_PROGRAM_LIMIT_EXCEEDED,
+            "tuple is too big!"
+        );
+    }
 
     (*RelationGetSmgr(rel)).smgr_targblock = targetBlock;
     buffer

@@ -5,6 +5,7 @@ use pgrx::pg_sys::{
     ScanDirection,
 };
 use pgrx::prelude::*;
+pub mod fetcher;
 
 #[pg_guard]
 unsafe extern "C-unwind" fn heapgettup_initial_block(
