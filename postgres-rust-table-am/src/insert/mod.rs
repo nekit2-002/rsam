@@ -1,4 +1,3 @@
-use pg_sys::WalLevel::WAL_LEVEL_REPLICA;
 use pgrx::pg_sys::ExtendBufferedFlags::EB_LOCK_FIRST;
 use pgrx::pg_sys::{
     pfree, pgstat_count_heap_insert, visibilitymap_clear, visibilitymap_pin, visibilitymap_pin_ok,
@@ -7,22 +6,20 @@ use pgrx::pg_sys::{
     CritSectionCount, ExtendBufferedRelBy, GetCurrentTransactionId, GetPageWithFreeSpace,
     HeapTuple, HeapTupleData, HeapTupleHeader, HeapTupleHeaderData, InvalidBlockNumber,
     InvalidBuffer, InvalidOffsetNumber, Item, ItemIdData, ItemPointerGetBlockNumber,
-    ItemPointerSet, LockBuffer, MarkBufferDirty, Page, PageAddItemExtended,
-    PageClearAllVisible, PageGetHeapFreeSpace, PageGetItem, PageGetItemId, PageInit,
-    PageIsAllVisible, PageIsNew, ParallelWorkerNumber, ReadBuffer, RecordAndGetPageWithFreeSpace,
-    RelationData, RelationGetNumberOfBlocksInFork, RelationGetSmgr, ReleaseBuffer,
-    SizeOfPageHeaderData, StdRdOptions, TransactionId, UnlockReleaseBuffer, BLCKSZ,
-    BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK, HEAP_COMBOCID,
-    HEAP_DEFAULT_FILLFACTOR, HEAP_INSERT_FROZEN, HEAP_INSERT_SKIP_FSM, HEAP_XACT_MASK,
-    HEAP_XMAX_INVALID, MAXALIGN, PAI_IS_HEAP, PAI_OVERWRITE, RELPERSISTENCE_PERMANENT,
-    RELPERSISTENCE_TEMP, VISIBILITYMAP_VALID_BITS,
+    ItemPointerSet, LockBuffer, MarkBufferDirty, Page, PageAddItemExtended, PageClearAllVisible,
+    PageGetHeapFreeSpace, PageGetItem, PageGetItemId, PageInit, PageIsAllVisible, PageIsNew,
+    ReadBuffer, RecordAndGetPageWithFreeSpace, RelationData, RelationGetNumberOfBlocksInFork,
+    RelationGetSmgr, ReleaseBuffer, SizeOfPageHeaderData, StdRdOptions, TransactionId,
+    UnlockReleaseBuffer, BLCKSZ, BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK,
+    HEAP_COMBOCID, HEAP_DEFAULT_FILLFACTOR, HEAP_INSERT_FROZEN, HEAP_INSERT_SKIP_FSM,
+    HEAP_XACT_MASK, HEAP_XMAX_INVALID, MAXALIGN, PAI_IS_HEAP, PAI_OVERWRITE,
+    RELPERSISTENCE_PERMANENT, RELPERSISTENCE_TEMP, VISIBILITYMAP_VALID_BITS,
 };
 use pgrx::pg_sys::{
     ForkNumber::*, FreeSpaceMapVacuumRange, RecordPageWithFreeSpace,
     RelationExtensionLockWaiterCount,
 };
 
-// overwrite
 use pgrx::prelude::*;
 use std::cmp::{max, min};
 
@@ -110,7 +107,7 @@ macro_rules! RelationGetTargetBlock {
 #[macro_export]
 macro_rules! XLogIsNeeded {
     () => {
-        wal_level >= WAL_LEVEL_REPLICA as i32
+        wal_level >= pg_sys::WalLevel::WAL_LEVEL_REPLICA as i32
     };
 }
 
@@ -280,21 +277,14 @@ unsafe extern "C-unwind" fn GetVisibilityMapPins(
     mut buffer2: Buffer,
     mut block1: BlockNumber,
     mut block2: BlockNumber,
-    mut vmbuffer1: *mut Buffer,
-    mut vmbuffer2: *mut Buffer,
+    vmbuffer1: *mut Buffer,
+    vmbuffer2: *mut Buffer,
 ) -> bool {
     let mut released_blocks = false;
     if !BufferIsValid(buffer1) || (BufferIsValid(buffer2) && block1 > block2) {
-        let tmpbuf = buffer1;
-        let tmpvmbuf = vmbuffer1;
-        let tmpblock = block1;
-
-        buffer1 = buffer2;
-        vmbuffer1 = vmbuffer2;
-        block1 = block2;
-        buffer2 = tmpbuf;
-        vmbuffer2 = tmpvmbuf;
-        block2 = tmpblock;
+        std::mem::swap(&mut buffer1, &mut buffer2);
+        std::mem::swap(&mut block1, &mut block2);
+        std::ptr::swap(vmbuffer1, vmbuffer2);
     }
 
     loop {
@@ -342,7 +332,7 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
     len: usize,
     otherBuffer: Buffer,
     options: i32,
-    _state: *mut BulkInsertStateData,
+    state: *mut BulkInsertStateData,
     vmbuffer: *mut Buffer,
     vmbuffer_other: *mut Buffer,
     num_pages: i32,
@@ -379,7 +369,6 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
         InvalidBlockNumber
     };
 
-    // (*(*rel).rd_smgr).smgr_targblock;
     let mut targetBlock = RelationGetTargetBlock!(rel);
 
     if targetBlock == InvalidBlockNumber && use_fsm {
@@ -459,7 +448,7 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
     let mut unlockedTargetBuffer = false;
     buffer = RelationAddBlocks(
         rel,
-        _state,
+        state,
         num_pages,
         use_fsm,
         &raw mut unlockedTargetBuffer,
