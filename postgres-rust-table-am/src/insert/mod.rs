@@ -2,20 +2,20 @@ use pg_sys::WalLevel::WAL_LEVEL_REPLICA;
 use pgrx::pg_sys::ExtendBufferedFlags::EB_LOCK_FIRST;
 use pgrx::pg_sys::{
     pfree, pgstat_count_heap_insert, visibilitymap_clear, visibilitymap_pin, visibilitymap_pin_ok,
-    BlockNumber, Buffer, BufferAccessStrategy, BufferGetBlockNumber, BufferGetPage,
-    BufferGetPageSize, BufferIsValid, BufferManagerRelation, BulkInsertState, BulkInsertStateData,
-    CommandId, ConditionalLockBuffer, CritSectionCount, GetCurrentTransactionId,
-    GetPageWithFreeSpace, HeapTuple, HeapTupleData, HeapTupleHeader, HeapTupleHeaderData,
-    InvalidBlockNumber, InvalidBuffer, InvalidOffsetNumber, Item, ItemIdData,
-    ItemPointerGetBlockNumber, ItemPointerSet, LockBuffer, MarkBufferDirty, Page,
-    PageAddItemExtended, PageClearAllVisible, PageGetHeapFreeSpace, PageGetItem, PageGetItemId,
-    PageInit, PageIsAllVisible, PageIsNew, ParallelWorkerNumber, ReadBuffer,
-    RecordAndGetPageWithFreeSpace, RelationData, RelationGetNumberOfBlocksInFork, RelationGetSmgr,
-    ReleaseBuffer, SizeOfPageHeaderData, StdRdOptions, TransactionId, UnlockReleaseBuffer, BLCKSZ,
+    BlockNumber, Buffer, BufferGetBlockNumber, BufferGetPage, BufferGetPageSize, BufferIsValid,
+    BufferManagerRelation, BulkInsertState, BulkInsertStateData, CommandId, ConditionalLockBuffer,
+    CritSectionCount, ExtendBufferedRelBy, GetCurrentTransactionId, GetPageWithFreeSpace,
+    HeapTuple, HeapTupleData, HeapTupleHeader, HeapTupleHeaderData, InvalidBlockNumber,
+    InvalidBuffer, InvalidOffsetNumber, Item, ItemIdData, ItemPointerGetBlockNumber,
+    ItemPointerSet, LockBuffer, MarkBufferDirty, Page, PageAddItemExtended,
+    PageClearAllVisible, PageGetHeapFreeSpace, PageGetItem, PageGetItemId, PageInit,
+    PageIsAllVisible, PageIsNew, ParallelWorkerNumber, ReadBuffer, RecordAndGetPageWithFreeSpace,
+    RelationData, RelationGetNumberOfBlocksInFork, RelationGetSmgr, ReleaseBuffer,
+    SizeOfPageHeaderData, StdRdOptions, TransactionId, UnlockReleaseBuffer, BLCKSZ,
     BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK, HEAP_COMBOCID,
     HEAP_DEFAULT_FILLFACTOR, HEAP_INSERT_FROZEN, HEAP_INSERT_SKIP_FSM, HEAP_XACT_MASK,
     HEAP_XMAX_INVALID, MAXALIGN, PAI_IS_HEAP, PAI_OVERWRITE, RELPERSISTENCE_PERMANENT,
-    VISIBILITYMAP_VALID_BITS,
+    RELPERSISTENCE_TEMP, VISIBILITYMAP_VALID_BITS,
 };
 use pgrx::pg_sys::{
     ForkNumber::*, FreeSpaceMapVacuumRange, RecordPageWithFreeSpace,
@@ -198,20 +198,6 @@ pub unsafe extern "C-unwind" fn prepare_insert(
 
 #[pg_guard]
 #[allow(non_snake_case)]
-unsafe extern "C-unwind" fn ExtendBufferedRelBy(
-    bmr: BufferManagerRelation,
-    fork: i32,
-    strat: BufferAccessStrategy,
-    flags: u32,
-    extend_by: u32,
-    buffers: *mut Buffer,
-    extended_by: *mut u32,
-) -> BlockNumber {
-    todo!("")
-}
-
-#[pg_guard]
-#[allow(non_snake_case)]
 unsafe extern "C-unwind" fn RelationAddBlocks(
     rel: *mut RelationData,
     _state: BulkInsertState,
@@ -219,42 +205,38 @@ unsafe extern "C-unwind" fn RelationAddBlocks(
     use_fsm: bool,
     did_unlock: *mut bool,
 ) -> Buffer {
-    let mut fst_block: BlockNumber = InvalidBlockNumber;
-    let mut last_block: BlockNumber = InvalidBlockNumber;
-    let mut extend_by_pages: u32 = 0;
     let mut victim_buffers: [Buffer; 64] = [0; 64];
-    let victim_buffers: *mut Buffer = (&mut victim_buffers).as_mut_ptr();
-    if !use_fsm {
-        extend_by_pages = 1;
+    let mut extend_by_pages = if !use_fsm {
+        1
     } else {
-        extend_by_pages = num_pages as u32;
+        let mut extend_by_pages = num_pages;
         let waitcount = if (*rel).rd_islocaltemp || (*rel).rd_createSubid != 0 {
             RelationExtensionLockWaiterCount(rel)
         } else {
             0
-        } as u32;
+        };
 
         extend_by_pages += extend_by_pages * waitcount;
-        extend_by_pages = min(extend_by_pages, 64);
-    }
+        min(extend_by_pages, 64)
+    } as u32;
 
     let not_in_fsm_pages = if num_pages > 1 { 1 } else { num_pages as u32 };
-    fst_block = ExtendBufferedRelBy(
+    let fst_block = ExtendBufferedRelBy(
         BufferManagerRelation {
             rel: rel,
-            smgr: RelationGetSmgr(rel),
+            smgr: std::ptr::null_mut(),
             relpersistence: (*(*rel).rd_rel).relpersistence,
         },
         MAIN_FORKNUM,
         std::ptr::null_mut(),
         EB_LOCK_FIRST,
         extend_by_pages,
-        victim_buffers,
+        victim_buffers.as_mut_ptr(),
         &raw mut extend_by_pages,
     );
 
-    let buffer = *victim_buffers;
-    last_block = fst_block + (extend_by_pages - 1);
+    let buffer = victim_buffers[0];
+    let last_block = fst_block + (extend_by_pages - 1);
     let page = BufferGetPage(buffer);
     if !PageIsNew(page) {
         ereport!(
@@ -275,10 +257,9 @@ unsafe extern "C-unwind" fn RelationAddBlocks(
 
     for i in 1..extend_by_pages {
         let cur = fst_block + i;
-        ReleaseBuffer(*(victim_buffers.add(i as usize)));
+        ReleaseBuffer(victim_buffers[i as usize]);
         if use_fsm && i >= not_in_fsm_pages {
-            let free_space =
-                BufferGetPageSize(*(victim_buffers.add(i as usize))) - SizeOfPageHeaderData();
+            let free_space = BufferGetPageSize(victim_buffers[i as usize]) - SizeOfPageHeaderData();
             RecordPageWithFreeSpace(rel, cur, free_space);
         }
     }
@@ -364,18 +345,15 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
     _state: *mut BulkInsertStateData,
     vmbuffer: *mut Buffer,
     vmbuffer_other: *mut Buffer,
-    mut num_pages: i32,
+    num_pages: i32,
 ) -> Buffer {
     let len = MAXALIGN(len);
     // it is safe to init page with null pointer as it is always reinited before being read
     let mut page: Page = std::ptr::null_mut();
     let use_fsm: bool = (options & HEAP_INSERT_SKIP_FSM as i32) == 0;
     let mut buffer: Buffer = InvalidBuffer as i32;
-    let (mut pageFreeSpace, mut saveFreeSpace, mut targetFreeSpace): (usize, usize, usize) =
-        (0, 0, 0);
-    if num_pages <= 0 {
-        num_pages = 1;
-    }
+    let mut pageFreeSpace: usize = 0;
+    let num_pages = if num_pages <= 0 { 1 } else { num_pages };
 
     if len > MaxHeapTupleSize!() {
         ereport!(
@@ -385,11 +363,11 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
         );
     }
     /* Compute desired extra freespace due to fillfactor option */
-    saveFreeSpace = RelationGetTargetPageFreeSpace!(rel, HEAP_DEFAULT_FILLFACTOR as i32);
+    let saveFreeSpace = RelationGetTargetPageFreeSpace!(rel, HEAP_DEFAULT_FILLFACTOR as i32);
     let nearlyEmptySpace: usize =
         MaxHeapTupleSize!() - (MaxHeapTuplesPerPage!() / 8 * std::mem::size_of::<ItemIdData>());
 
-    targetFreeSpace = if len + saveFreeSpace > nearlyEmptySpace {
+    let targetFreeSpace = if len + saveFreeSpace > nearlyEmptySpace {
         max(len, nearlyEmptySpace)
     } else {
         len + saveFreeSpace
@@ -415,6 +393,7 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
         }
     }
 
+    // TODO: here must be the label
     while targetBlock != InvalidBlockNumber {
         if otherBuffer == InvalidBuffer as i32 {
         } else if otherBlock == targetBlock {
