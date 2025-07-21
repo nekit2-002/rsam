@@ -1,6 +1,7 @@
 use crate::am_handler_port::{new_table_am_routine, TableAmArgs, TableAmHandler, TableAmRoutine};
 use crate::insert::*;
 use crate::scan::*;
+use crate::scan::fetcher::{self, heap_gettup, heap_gettup_pagemode};
 use pg_sys::{
     palloc, read_stream_begin_relation, read_stream_end, read_stream_reset, BlockNumber,
     BufferAccessStrategy, BufferAccessStrategyData, BufferIsValid, BulkInsertStateData, CommandId,
@@ -17,8 +18,7 @@ use pgrx::pg_sys::BufferAccessStrategyType::BAS_BULKREAD;
 use pgrx::pg_sys::ScanDirection::ForwardScanDirection;
 use pgrx::pg_sys::ScanOptions::SO_ALLOW_SYNC;
 use pgrx::pg_sys::{
-    pfree, synchronize_seqscans, ExecFetchSlotHeapTuple, FreeAccessStrategy, GetAccessStrategy,
-    InvalidBlockNumber, ItemPointerCopy, ItemPointerSetInvalid, RelationDecrementReferenceCount,
+    pfree, synchronize_seqscans, ExecFetchSlotHeapTuple, ExecStoreBufferHeapTuple, FreeAccessStrategy, GetAccessStrategy, InvalidBlockNumber, ItemPointerCopy, ItemPointerSetInvalid, RelationDecrementReferenceCount
 };
 use pgrx::{
     pg_sys::{
@@ -279,11 +279,26 @@ unsafe extern "C-unwind" fn scan_rescan(
 
 #[pg_guard]
 unsafe extern "C-unwind" fn scan_getnextslot(
-    _scan: TableScanDesc,
-    _direction: ScanDirection::Type,
-    _slot: *mut TupleTableSlot,
+    sscan: TableScanDesc,
+    direction: ScanDirection::Type,
+    slot: *mut TupleTableSlot,
 ) -> bool {
-    todo!("scan_getnextslot")
+    let scan = sscan as HeapScanDesc;
+    if ((*sscan).rs_flags & SO_ALLOW_PAGEMODE) != 0 {
+        heap_gettup_pagemode(scan, direction, (*sscan).rs_nkeys, (*sscan).rs_key);
+    } else {
+        heap_gettup(scan, direction,(*sscan).rs_nkeys, (*sscan).rs_key);
+    }
+
+    if (*scan).rs_ctup.t_data.is_null() {
+        let clear = (*(*slot).tts_ops).clear.expect("no clear method in TTSOps!");
+        clear(slot);
+        return false;
+    }
+
+    pgstat_count_heap_getnext((*scan).rs_base.rs_rd);
+    ExecStoreBufferHeapTuple(&raw mut (*scan).rs_ctup, slot, (*scan).rs_cbuf);
+    true
 }
 
 #[pg_guard]

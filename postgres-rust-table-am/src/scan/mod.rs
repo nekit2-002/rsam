@@ -117,3 +117,10 @@ pub unsafe extern "C-unwind" fn pgstat_count_heap_scan(rel: *mut RelationData) {
         (*(*rel).pgstat_info).counts.numscans += 1;
     }
 }
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn pgstat_count_heap_getnext(rel: *mut RelationData) {
+    if pgstat_should_count_relation(rel) {
+        (*(*rel).pgstat_info).counts.tuples_returned += 1;
+    }
+}
