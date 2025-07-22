@@ -3,6 +3,7 @@ mod slot;
 mod table_am_handler;
 mod scan;
 mod insert;
+mod include;
 
 pgrx::pg_module_magic!();
 

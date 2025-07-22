@@ -34,6 +34,7 @@ use pg_sys::{
     SK_ISNULL,
 };
 
+use crate::include::general::*;
 use pg_sys::ScanDirection::*;
 use pgrx::prelude::*;
 use std::cmp::min;
@@ -83,6 +84,7 @@ macro_rules! OffsetNumberPrev {
 
 #[pg_guard]
 unsafe extern "C-unwind" fn heap_fetch_next_buffer(scan: *mut HeapScanDescData, scandir: i32) {
+    Assert(!(*scan).rs_read_stream.is_null());
     if BufferIsValid((*scan).rs_cbuf) {
         ReleaseBuffer((*scan).rs_cbuf);
         (*scan).rs_cbuf = InvalidBuffer as i32;
@@ -166,6 +168,9 @@ pub unsafe extern "C-unwind" fn heap_gettup_pagemode(
             if !BufferIsValid((*scan).rs_cbuf) {
                 break;
             }
+
+            Assert(BufferGetBlockNumber((*scan).rs_cbuf) == (*scan).rs_cblock);
+
             heap_prepare_pagescan(scan.cast());
             page = BufferGetPage((*scan).rs_cbuf);
             lines_left = (*scan).rs_ntuples;
@@ -174,8 +179,11 @@ pub unsafe extern "C-unwind" fn heap_gettup_pagemode(
         },
         {
             while lines_left > 0 {
+                Assert(line_index <= (*scan).rs_ntuples);
                 let line_offset = (*scan).rs_vistuples[line_index as usize];
                 let lpp: ItemId = PageGetItemId(page, line_offset);
+                Assert(ItemIdIsNormal!(lpp));
+
                 (*tuple).t_data = PageGetItem(page, lpp).cast();
                 (*tuple).t_len = (*lpp).lp_len();
                 ItemPointerSetOffsetNumber(&raw mut (*tuple).t_self, line_offset);
@@ -234,6 +242,9 @@ unsafe extern "C-unwind" fn heap_gettup_start_page(
     lines_left: *mut i32,
     line_offset: *mut OffsetNumber,
 ) -> Page {
+    Assert((*scan).rs_inited);
+    Assert(BufferIsValid((*scan).rs_cbuf));
+
     let page = BufferGetPage((*scan).rs_cbuf);
     *lines_left = (PageGetMaxOffsetNumber(page) - FirstOffsetNumber + 1) as i32;
     *line_offset = if scandir == ForwardScanDirection {
@@ -268,6 +279,8 @@ pub unsafe extern "C-unwind" fn heap_gettup(
             if !BufferIsValid((*scan).rs_cbuf) {
                 break;
             }
+
+            Assert(BufferGetBlockNumber((*scan).rs_cbuf) == (*scan).rs_cblock);
 
             LockBuffer((*scan).rs_cbuf, BUFFER_LOCK_SHARE as i32);
             page = heap_gettup_start_page(scan, dir, &raw mut lines_left, &raw mut line_offset)

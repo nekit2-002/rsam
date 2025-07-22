@@ -13,13 +13,14 @@ use pgrx::pg_sys::{
     UnlockReleaseBuffer, BLCKSZ, BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK,
     HEAP_COMBOCID, HEAP_DEFAULT_FILLFACTOR, HEAP_INSERT_FROZEN, HEAP_INSERT_SKIP_FSM,
     HEAP_XACT_MASK, HEAP_XMAX_INVALID, MAXALIGN, PAI_IS_HEAP, PAI_OVERWRITE,
-    RELPERSISTENCE_PERMANENT, RELPERSISTENCE_TEMP, VISIBILITYMAP_VALID_BITS,
+    RELPERSISTENCE_TEMP, VISIBILITYMAP_VALID_BITS
 };
 use pgrx::pg_sys::{
     ForkNumber::*, FreeSpaceMapVacuumRange, RecordPageWithFreeSpace,
     RelationExtensionLockWaiterCount,
 };
 
+use crate::include::relaion_macro::*;
 use pgrx::prelude::*;
 use std::cmp::{max, min};
 
@@ -69,54 +70,9 @@ macro_rules! END_CRIT_SECTION {
 }
 
 #[macro_export]
-macro_rules! RelationIsPermanent {
-    ($rel:expr) => {
-        (*(*$rel).rd_rel).relpersistence == RELPERSISTENCE_PERMANENT as i8
-    };
-}
-
-#[macro_export]
-macro_rules! RelationGetFillFactor {
-    ($rel:expr, $defaultff:expr) => {
-        if !(*$rel).rd_options.is_null() {
-            (*((*$rel).rd_options as *mut StdRdOptions)).fillfactor
-        } else {
-            $defaultff
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! RelationGetTargetPageFreeSpace {
-    ($rel:expr, $defaultff: expr) => {
-        BLCKSZ as usize * (100 - RelationGetFillFactor!($rel, $defaultff) / 100) as usize
-    };
-}
-
-#[macro_export]
-macro_rules! RelationGetTargetBlock {
-    ($rel:expr) => {
-        if !(*$rel).rd_smgr.is_null() {
-            (*(*$rel).rd_smgr).smgr_targblock
-        } else {
-            InvalidBlockNumber
-        }
-    };
-}
-
-#[macro_export]
 macro_rules! XLogIsNeeded {
     () => {
         wal_level >= pg_sys::WalLevel::WAL_LEVEL_REPLICA as i32
-    };
-}
-
-#[macro_export]
-macro_rules! RelationNeedsWal {
-    ($rel:expr) => {
-        RelationIsPermanent!($rel)
-            && (XLogIsNeeded!()
-                || (*$rel).rd_createSubid == 0 && (*$rel).rd_firstRelfilelocatorSubid == 0)
     };
 }
 
