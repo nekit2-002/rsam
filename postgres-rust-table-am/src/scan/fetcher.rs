@@ -1,8 +1,14 @@
 use pg_sys::{
+    check_for_interrupts,
     heap_getattr,
     heap_prepare_pagescan,
+    read_stream_next_buffer,
+    read_stream_reset,
+    BufferGetBlockNumber,
     BufferGetPage,
     BufferIsValid,
+    DatumGetBool,
+    FirstOffsetNumber,
     FunctionCall2Coll,
     HeapScanDesc,
     HeapScanDescData,
@@ -19,15 +25,18 @@ use pg_sys::{
     Page,
     PageGetItem,
     PageGetItemId,
+    PageGetMaxOffsetNumber,
     ReleaseBuffer,
     ScanKeyData,
     TupleDesc,
     BUFFER_LOCK_SHARE,
     BUFFER_LOCK_UNLOCK,
     SK_ISNULL,
-    DatumGetBool
 };
+
+use pg_sys::ScanDirection::*;
 use pgrx::prelude::*;
+use std::cmp::min;
 
 #[macro_export]
 macro_rules! partial_loop {
@@ -58,8 +67,39 @@ macro_rules! ItemIdIsNormal {
     };
 }
 
+#[macro_export]
+macro_rules! OffsetNumberNext {
+    ($offn:expr) => {
+        1 + $offn
+    };
+}
+
+#[macro_export]
+macro_rules! OffsetNumberPrev {
+    ($offn:expr) => {
+        $offn - 1
+    };
+}
+
 #[pg_guard]
-unsafe extern "C-unwind" fn heap_fetch_next_buffer(scan: *mut HeapScanDescData, dir: i32) {}
+unsafe extern "C-unwind" fn heap_fetch_next_buffer(scan: *mut HeapScanDescData, scandir: i32) {
+    if BufferIsValid((*scan).rs_cbuf) {
+        ReleaseBuffer((*scan).rs_cbuf);
+        (*scan).rs_cbuf = InvalidBuffer as i32;
+    }
+
+    check_for_interrupts!();
+    if (*scan).rs_dir != scandir {
+        (*scan).rs_prefetch_block = (*scan).rs_cblock;
+        read_stream_reset((*scan).rs_read_stream);
+    }
+
+    (*scan).rs_dir = scandir;
+    (*scan).rs_cbuf = read_stream_next_buffer((*scan).rs_read_stream, std::ptr::null_mut());
+    if BufferIsValid((*scan).rs_cbuf) {
+        (*scan).rs_cblock = BufferGetBlockNumber((*scan).rs_cbuf)
+    }
+}
 #[pg_guard]
 unsafe extern "C-unwind" fn heap_key_test(
     tuple: HeapTuple,
@@ -169,21 +209,39 @@ pub unsafe extern "C-unwind" fn heap_gettup_pagemode(
 #[pg_guard]
 unsafe extern "C-unwind" fn heap_gettup_continue_page(
     scan: HeapScanDesc,
-    dir: i32,
+    scandir: i32,
     lines_left: *mut i32,
     line_offset: *mut OffsetNumber,
 ) -> Page {
-    todo!("")
+    let page = BufferGetPage((*scan).rs_cbuf);
+    if scandir == ForwardScanDirection {
+        *line_offset = OffsetNumberNext!((*scan).rs_coffset);
+        *lines_left = (PageGetMaxOffsetNumber(page) - (*line_offset) + 1) as i32;
+    } else {
+        *line_offset = min(
+            PageGetMaxOffsetNumber(page),
+            OffsetNumberPrev!((*scan).rs_coffset),
+        );
+        *lines_left = *line_offset as i32;
+    }
+    page
 }
 
 #[pg_guard]
 unsafe extern "C-unwind" fn heap_gettup_start_page(
     scan: HeapScanDesc,
-    dir: i32,
+    scandir: i32,
     lines_left: *mut i32,
     line_offset: *mut OffsetNumber,
 ) -> Page {
-    todo!("")
+    let page = BufferGetPage((*scan).rs_cbuf);
+    *lines_left = (PageGetMaxOffsetNumber(page) - FirstOffsetNumber + 1) as i32;
+    *line_offset = if scandir == ForwardScanDirection {
+        FirstOffsetNumber
+    } else {
+        (*lines_left) as OffsetNumber
+    };
+    page
 }
 
 #[pg_guard]
