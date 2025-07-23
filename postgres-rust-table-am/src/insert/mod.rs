@@ -163,7 +163,7 @@ unsafe extern "C-unwind" fn RelationAddBlocks(
         1
     } else {
         let mut extend_by_pages = num_pages;
-        let waitcount = if (*rel).rd_islocaltemp || (*rel).rd_createSubid != 0 {
+        let waitcount = if !RelationIsLocal!(rel) {
             RelationExtensionLockWaiterCount(rel)
         } else {
             0

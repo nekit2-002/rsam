@@ -52,3 +52,12 @@ macro_rules! RelationNeedsWal {
 }
 
 pub use RelationNeedsWal;
+
+#[macro_export]
+macro_rules! RelationIsLocal {
+    ($rel:expr) => {
+        (*$rel).rd_islocaltemp || (*$rel).rd_createSubid != 0
+    };
+}
+
+pub use RelationIsLocal;
