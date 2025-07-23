@@ -1,4 +1,5 @@
 use pgrx::pg_sys::ExtendBufferedFlags::EB_LOCK_FIRST;
+use pgrx::pg_sys::ReadBufferMode::RBM_NORMAL;
 use pgrx::pg_sys::{
     pfree, pgstat_count_heap_insert, visibilitymap_clear, visibilitymap_pin, visibilitymap_pin_ok,
     BlockNumber, Buffer, BufferGetBlockNumber, BufferGetPage, BufferGetPageSize, BufferIsValid,
@@ -8,12 +9,12 @@ use pgrx::pg_sys::{
     InvalidBuffer, InvalidOffsetNumber, Item, ItemIdData, ItemPointerGetBlockNumber,
     ItemPointerSet, LockBuffer, MarkBufferDirty, Page, PageAddItemExtended, PageClearAllVisible,
     PageGetHeapFreeSpace, PageGetItem, PageGetItemId, PageInit, PageIsAllVisible, PageIsNew,
-    ReadBuffer, RecordAndGetPageWithFreeSpace, RelationData, RelationGetNumberOfBlocksInFork,
-    RelationGetSmgr, ReleaseBuffer, SizeOfPageHeaderData, StdRdOptions, TransactionId,
-    UnlockReleaseBuffer, BLCKSZ, BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK,
-    HEAP_COMBOCID, HEAP_DEFAULT_FILLFACTOR, HEAP_INSERT_FROZEN, HEAP_INSERT_SKIP_FSM,
-    HEAP_XACT_MASK, HEAP_XMAX_INVALID, MAXALIGN, PAI_IS_HEAP, PAI_OVERWRITE, RELPERSISTENCE_TEMP,
-    VISIBILITYMAP_VALID_BITS,
+    ReadBuffer, ReadBufferExtended, RecordAndGetPageWithFreeSpace, RelationData,
+    RelationGetNumberOfBlocksInFork, RelationGetSmgr, ReleaseBuffer, SizeOfPageHeaderData,
+    StdRdOptions, TransactionId, UnlockReleaseBuffer, BLCKSZ, BUFFER_LOCK_EXCLUSIVE,
+    BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK, HEAP_COMBOCID, HEAP_DEFAULT_FILLFACTOR,
+    HEAP_INSERT_FROZEN, HEAP_INSERT_SKIP_FSM, HEAP_XACT_MASK, HEAP_XMAX_INVALID, MAXALIGN,
+    PAI_IS_HEAP, PAI_OVERWRITE, RELPERSISTENCE_TEMP, VISIBILITYMAP_VALID_BITS,
 };
 use pgrx::pg_sys::{
     ForkNumber::*, FreeSpaceMapVacuumRange, RecordPageWithFreeSpace,
@@ -344,6 +345,19 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
     loop {
         while targetBlock != InvalidBlockNumber {
             if otherBuffer == InvalidBuffer as i32 {
+                // Ветка работает при запуске первой повторной вставки
+                buffer = ReadBufferExtended(
+                    rel,
+                    MAIN_FORKNUM,
+                    targetBlock,
+                    RBM_NORMAL,
+                    std::ptr::null_mut(),
+                );
+                if PageIsAllVisible(BufferGetPage(buffer)) {
+                    visibilitymap_pin(rel, targetBlock, vmbuffer);
+                }
+
+                LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
             } else if otherBlock == targetBlock {
                 buffer = otherBuffer;
                 if PageIsAllVisible(BufferGetPage(buffer)) {
@@ -458,7 +472,6 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
         }
 
         pageFreeSpace = PageGetHeapFreeSpace(page);
-
 
         if len > pageFreeSpace {
             if unlockedTargetBuffer {
