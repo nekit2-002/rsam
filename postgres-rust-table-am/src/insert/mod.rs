@@ -12,8 +12,8 @@ use pgrx::pg_sys::{
     RelationGetSmgr, ReleaseBuffer, SizeOfPageHeaderData, StdRdOptions, TransactionId,
     UnlockReleaseBuffer, BLCKSZ, BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK,
     HEAP_COMBOCID, HEAP_DEFAULT_FILLFACTOR, HEAP_INSERT_FROZEN, HEAP_INSERT_SKIP_FSM,
-    HEAP_XACT_MASK, HEAP_XMAX_INVALID, MAXALIGN, PAI_IS_HEAP, PAI_OVERWRITE,
-    RELPERSISTENCE_TEMP, VISIBILITYMAP_VALID_BITS
+    HEAP_XACT_MASK, HEAP_XMAX_INVALID, MAXALIGN, PAI_IS_HEAP, PAI_OVERWRITE, RELPERSISTENCE_TEMP,
+    VISIBILITYMAP_VALID_BITS,
 };
 use pgrx::pg_sys::{
     ForkNumber::*, FreeSpaceMapVacuumRange, RecordPageWithFreeSpace,
@@ -282,7 +282,7 @@ unsafe extern "C-unwind" fn GetVisibilityMapPins(
 }
 
 #[pg_guard]
-#[allow(non_snake_case)] // TODO: implement this function
+#[allow(non_snake_case)]
 pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
     rel: *mut RelationData,
     len: usize,
@@ -338,132 +338,140 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
         }
     }
 
-    // TODO: here must be the label
-    while targetBlock != InvalidBlockNumber {
-        if otherBuffer == InvalidBuffer as i32 {
-        } else if otherBlock == targetBlock {
-            buffer = otherBuffer;
-            if PageIsAllVisible(BufferGetPage(buffer)) {
-                visibilitymap_pin(rel, targetBlock, vmbuffer);
+    loop {
+        while targetBlock != InvalidBlockNumber {
+            if otherBuffer == InvalidBuffer as i32 {
+            } else if otherBlock == targetBlock {
+                buffer = otherBuffer;
+                if PageIsAllVisible(BufferGetPage(buffer)) {
+                    visibilitymap_pin(rel, targetBlock, vmbuffer);
+                }
+                LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
+            } else if otherBlock < targetBlock {
+                buffer = ReadBuffer(rel, targetBlock);
+                if PageIsAllVisible(BufferGetPage(buffer)) {
+                    visibilitymap_pin(rel, targetBlock, vmbuffer);
+                }
+                LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE as i32);
+                LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
+            } else {
+                buffer = ReadBuffer(rel, targetBlock);
+                if PageIsAllVisible(BufferGetPage(buffer)) {
+                    visibilitymap_pin(rel, targetBlock, vmbuffer);
+                }
+                LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
+                LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE as i32);
             }
-            LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
-        } else if otherBlock < targetBlock {
-            buffer = ReadBuffer(rel, targetBlock);
-            if PageIsAllVisible(BufferGetPage(buffer)) {
-                visibilitymap_pin(rel, targetBlock, vmbuffer);
+
+            GetVisibilityMapPins(
+                rel,
+                buffer,
+                otherBuffer,
+                targetBlock,
+                otherBlock,
+                vmbuffer,
+                vmbuffer_other,
+            );
+            page = BufferGetPage(buffer);
+            if PageIsNew(page) {
+                PageInit(page, BufferGetPageSize(buffer), 0);
+                MarkBufferDirty(buffer);
             }
-            LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE as i32);
-            LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
-        } else {
-            buffer = ReadBuffer(rel, targetBlock);
-            if PageIsAllVisible(BufferGetPage(buffer)) {
-                visibilitymap_pin(rel, targetBlock, vmbuffer);
+
+            pageFreeSpace = PageGetHeapFreeSpace(page);
+            if targetFreeSpace <= pageFreeSpace {
+                (*RelationGetSmgr(rel)).smgr_targblock = targetBlock;
+                return buffer;
             }
-            LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
-            LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE as i32);
+
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+            if otherBuffer == InvalidBuffer as i32 {
+                ReleaseBuffer(buffer);
+            } else if otherBlock != targetBlock {
+                LockBuffer(otherBuffer, BUFFER_LOCK_UNLOCK as i32);
+                ReleaseBuffer(buffer);
+            }
+
+            if !use_fsm {
+                break;
+            } else {
+                targetBlock =
+                    RecordAndGetPageWithFreeSpace(rel, targetBlock, pageFreeSpace, targetFreeSpace);
+            }
         }
 
-        GetVisibilityMapPins(
+        // Have to extend relation
+        let mut unlockedTargetBuffer = false;
+        buffer = RelationAddBlocks(
             rel,
-            buffer,
-            otherBuffer,
-            targetBlock,
-            otherBlock,
-            vmbuffer,
-            vmbuffer_other,
+            state,
+            num_pages,
+            use_fsm,
+            &raw mut unlockedTargetBuffer,
         );
+        targetBlock = BufferGetBlockNumber(buffer);
         page = BufferGetPage(buffer);
-        if PageIsNew(page) {
-            PageInit(page, BufferGetPageSize(buffer), 0);
-            MarkBufferDirty(buffer);
+        pageFreeSpace = PageGetHeapFreeSpace(page);
+
+        if options & HEAP_INSERT_FROZEN as i32 != 0 {
+            if !visibilitymap_pin_ok(targetBlock, *vmbuffer) {
+                if !unlockedTargetBuffer {
+                    LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+                }
+                unlockedTargetBuffer = true;
+                visibilitymap_pin(rel, targetBlock, vmbuffer);
+            }
+        }
+
+        let mut recheckVmPins = false;
+        if unlockedTargetBuffer {
+            if otherBuffer != InvalidBuffer as i32 {
+                LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE as i32);
+            }
+            LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
+            recheckVmPins = true;
+        } else if otherBuffer != InvalidBuffer as i32 {
+            if !ConditionalLockBuffer(otherBuffer) {
+                unlockedTargetBuffer = true;
+                LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+                LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE as i32);
+                LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
+            }
+            recheckVmPins = true;
+        }
+
+        if recheckVmPins {
+            if GetVisibilityMapPins(
+                rel,
+                otherBuffer,
+                buffer,
+                otherBlock,
+                targetBlock,
+                vmbuffer_other,
+                vmbuffer,
+            ) {
+                unlockedTargetBuffer = true;
+            }
         }
 
         pageFreeSpace = PageGetHeapFreeSpace(page);
-        if targetFreeSpace <= pageFreeSpace {
-            (*RelationGetSmgr(rel)).smgr_targblock = targetBlock;
-            return buffer;
-        }
 
-        LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
-        if otherBuffer == InvalidBuffer as i32 {
-            ReleaseBuffer(buffer);
-        } else if otherBlock != targetBlock {
-            LockBuffer(otherBuffer, BUFFER_LOCK_UNLOCK as i32);
-            ReleaseBuffer(buffer);
-        }
-
-        if !use_fsm {
-            break;
-        } else {
-            targetBlock =
-                RecordAndGetPageWithFreeSpace(rel, targetBlock, pageFreeSpace, targetFreeSpace);
-        }
-    }
-
-    // Have to extend relation
-    let mut unlockedTargetBuffer = false;
-    buffer = RelationAddBlocks(
-        rel,
-        state,
-        num_pages,
-        use_fsm,
-        &raw mut unlockedTargetBuffer,
-    );
-    targetBlock = BufferGetBlockNumber(buffer);
-    page = BufferGetPage(buffer);
-    pageFreeSpace = PageGetHeapFreeSpace(page);
-
-    if options & HEAP_INSERT_FROZEN as i32 != 0 {
-        if !visibilitymap_pin_ok(targetBlock, *vmbuffer) {
-            if !unlockedTargetBuffer {
-                LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+        // TODO: implement this, here must be either error or goto loop statement
+        if len > pageFreeSpace {
+            if unlockedTargetBuffer {
+                if otherBuffer != InvalidBuffer as i32 {
+                    LockBuffer(otherBuffer, BUFFER_LOCK_UNLOCK as i32);
+                }
+                UnlockReleaseBuffer(buffer);
+                continue;
             }
-            unlockedTargetBuffer = true;
-            visibilitymap_pin(rel, targetBlock, vmbuffer);
+            ereport!(
+                PgLogLevel::PANIC,
+                PgSqlErrorCode::ERRCODE_PROGRAM_LIMIT_EXCEEDED,
+                "tuple is too big!"
+            );
         }
-    }
-
-    let mut recheckVmPins = false;
-    if unlockedTargetBuffer {
-        if otherBuffer != InvalidBuffer as i32 {
-            LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE as i32);
-        }
-        LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
-        recheckVmPins = true;
-    } else if otherBuffer != InvalidBuffer as i32 {
-        if !ConditionalLockBuffer(otherBuffer) {
-            unlockedTargetBuffer = true;
-            LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
-            LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE as i32);
-            LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
-        }
-        recheckVmPins = true;
-    }
-
-    if recheckVmPins {
-        if GetVisibilityMapPins(
-            rel,
-            otherBuffer,
-            buffer,
-            otherBlock,
-            targetBlock,
-            vmbuffer_other,
-            vmbuffer,
-        ) {
-            unlockedTargetBuffer = true;
-        }
-    }
-
-    pageFreeSpace = PageGetHeapFreeSpace(page);
-
-    // TODO: implement this, here must be either error or goto loop statement
-    if len > pageFreeSpace {
-        if unlockedTargetBuffer {}
-        ereport!(
-            PgLogLevel::PANIC,
-            PgSqlErrorCode::ERRCODE_PROGRAM_LIMIT_EXCEEDED,
-            "tuple is too big!"
-        );
+        break;
     }
 
     (*RelationGetSmgr(rel)).smgr_targblock = targetBlock;
