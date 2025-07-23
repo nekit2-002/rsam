@@ -2,19 +2,21 @@ use pgrx::pg_sys::ExtendBufferedFlags::EB_LOCK_FIRST;
 use pgrx::pg_sys::ReadBufferMode::RBM_NORMAL;
 use pgrx::pg_sys::{
     pfree, pgstat_count_heap_insert, visibilitymap_clear, visibilitymap_pin, visibilitymap_pin_ok,
-    BlockNumber, Buffer, BufferGetBlockNumber, BufferGetPage, BufferGetPageSize, BufferIsValid,
-    BufferManagerRelation, BulkInsertState, BulkInsertStateData, CommandId, ConditionalLockBuffer,
-    CritSectionCount, ExtendBufferedRelBy, GetCurrentTransactionId, GetPageWithFreeSpace,
-    HeapTuple, HeapTupleData, HeapTupleHeader, HeapTupleHeaderData, InvalidBlockNumber,
-    InvalidBuffer, InvalidOffsetNumber, Item, ItemIdData, ItemPointerGetBlockNumber,
-    ItemPointerSet, LockBuffer, MarkBufferDirty, Page, PageAddItemExtended, PageClearAllVisible,
-    PageGetHeapFreeSpace, PageGetItem, PageGetItemId, PageInit, PageIsAllVisible, PageIsNew,
+    BlockNumber, BlockNumberIsValid, Buffer, BufferGetBlockNumber, BufferGetPage,
+    BufferGetPageSize, BufferIsValid, BufferManagerRelation, BulkInsertState, BulkInsertStateData,
+    CommandId, ConditionalLockBuffer, CritSectionCount, ExtendBufferedRelBy,
+    GetCurrentTransactionId, GetPageWithFreeSpace, HeapTuple, HeapTupleData, HeapTupleHeader,
+    HeapTupleHeaderData, HeapTupleHeaderGetNatts, InvalidBlockNumber, InvalidBuffer,
+    InvalidOffsetNumber, Item, ItemIdData, ItemPointerGetBlockNumber, ItemPointerSet, LockBuffer,
+    MarkBufferDirty, Page, PageAddItemExtended, PageClearAllVisible, PageGetHeapFreeSpace,
+    PageGetItem, PageGetItemId, PageGetMaxOffsetNumber, PageInit, PageIsAllVisible, PageIsNew,
     ReadBuffer, ReadBufferExtended, RecordAndGetPageWithFreeSpace, RelationData,
     RelationGetNumberOfBlocksInFork, RelationGetSmgr, ReleaseBuffer, SizeOfPageHeaderData,
     StdRdOptions, TransactionId, UnlockReleaseBuffer, BLCKSZ, BUFFER_LOCK_EXCLUSIVE,
     BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK, HEAP_COMBOCID, HEAP_DEFAULT_FILLFACTOR,
-    HEAP_INSERT_FROZEN, HEAP_INSERT_SKIP_FSM, HEAP_XACT_MASK, HEAP_XMAX_INVALID, MAXALIGN,
-    PAI_IS_HEAP, PAI_OVERWRITE, RELPERSISTENCE_TEMP, VISIBILITYMAP_VALID_BITS,
+    HEAP_INSERT_FROZEN, HEAP_INSERT_SKIP_FSM, HEAP_XACT_MASK, HEAP_XMAX_COMMITTED,
+    HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, MAXALIGN, PAI_IS_HEAP, PAI_OVERWRITE,
+    RELPERSISTENCE_TEMP, VISIBILITYMAP_VALID_BITS,
 };
 use pgrx::pg_sys::{
     ForkNumber::*, FreeSpaceMapVacuumRange, RecordPageWithFreeSpace,
@@ -192,6 +194,8 @@ unsafe extern "C-unwind" fn RelationAddBlocks(
 
     let buffer = victim_buffers[0];
     let last_block = fst_block + (extend_by_pages - 1);
+    Assert(fst_block == BufferGetBlockNumber(buffer));
+
     let page = BufferGetPage(buffer);
     if !PageIsNew(page) {
         ereport!(
@@ -212,6 +216,9 @@ unsafe extern "C-unwind" fn RelationAddBlocks(
 
     for i in 1..extend_by_pages {
         let cur = fst_block + i;
+        Assert(cur == BufferGetBlockNumber(victim_buffers[i as usize]));
+        Assert(BlockNumberIsValid(cur));
+
         ReleaseBuffer(victim_buffers[i as usize]);
         if use_fsm && i >= not_in_fsm_pages {
             let free_space = BufferGetPageSize(victim_buffers[i as usize]) - SizeOfPageHeaderData();
@@ -239,11 +246,15 @@ unsafe extern "C-unwind" fn GetVisibilityMapPins(
     vmbuffer2: *mut Buffer,
 ) -> bool {
     let mut released_blocks = false;
+
     if !BufferIsValid(buffer1) || (BufferIsValid(buffer2) && block1 > block2) {
         std::mem::swap(&mut buffer1, &mut buffer2);
         std::mem::swap(&mut block1, &mut block2);
         std::ptr::swap(vmbuffer1, vmbuffer2);
     }
+
+    Assert(BufferIsValid(buffer1));
+    Assert(buffer2 == InvalidBuffer as i32 || block1 <= block2);
 
     loop {
         let need_to_pin_buffer1 =
@@ -431,6 +442,7 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
         pageFreeSpace = PageGetHeapFreeSpace(page);
 
         if options & HEAP_INSERT_FROZEN as i32 != 0 {
+            Assert(PageGetMaxOffsetNumber(page) == 0);
             if !visibilitymap_pin_ok(targetBlock, *vmbuffer) {
                 if !unlockedTargetBuffer {
                     LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
@@ -448,12 +460,16 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
             LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
             recheckVmPins = true;
         } else if otherBuffer != InvalidBuffer as i32 {
+            Assert(otherBuffer != buffer);
+            Assert(targetBlock > otherBlock);
+
             if !ConditionalLockBuffer(otherBuffer) {
                 unlockedTargetBuffer = true;
                 LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
                 LockBuffer(otherBuffer, BUFFER_LOCK_EXCLUSIVE as i32);
                 LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
             }
+
             recheckVmPins = true;
         }
 
@@ -500,6 +516,10 @@ pub unsafe extern "C-unwind" fn relation_put_tuple(
     buffer: Buffer,
     tuple: *mut HeapTupleData,
 ) {
+    // Assert(
+    //     !((*(*tuple).t_data).t_infomask & HEAP_XMAX_COMMITTED as u16) != 0
+    //         && ((*(*tuple).t_data).t_infomask & HEAP_XMAX_IS_MULTI as u16 != 0),
+    // );
     let pageHeader = BufferGetPage(buffer);
     let offnum: u16 = PageAddItem!(
         pageHeader,
@@ -510,9 +530,12 @@ pub unsafe extern "C-unwind" fn relation_put_tuple(
         true
     );
 
-    // TODO: implement failure in case of failing to insert a tuple to the page
-    // if offnum == InvalidOffsetNumber{
-
+    // if offnum == InvalidOffsetNumber {
+        // ereport!(
+        //     PgLogLevel::PANIC,
+        //     PgSqlErrorCode::ERRCODE_ASSERT_FAILURE,
+        //     "failed to add tuple to page"
+        // );
     // }
 
     ItemPointerSet(
@@ -536,6 +559,7 @@ pub unsafe extern "C-unwind" fn heap_insert(
     let xid = GetCurrentTransactionId();
     let mut vmbuffer = InvalidBuffer as i32;
     let mut all_visible_cleared = false;
+    Assert(HeapTupleHeaderGetNatts((*tup).t_data) <= (*(*rel).rd_rel).relnatts as u16);
 
     /* Fill in tuple header fields and toast the tuple if necessary.
 

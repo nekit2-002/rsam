@@ -3,17 +3,17 @@ use crate::insert::*;
 use crate::scan::fetcher::{self, heap_gettup, heap_gettup_pagemode};
 use crate::scan::*;
 use pg_sys::{
-    palloc, read_stream_begin_relation, read_stream_end, read_stream_reset, BlockNumber,
-    BufferAccessStrategy, BufferAccessStrategyData, BufferIsValid, BulkInsertStateData, CommandId,
-    ForkNumber, HeapScanDesc, HeapScanDescData, IndexBuildCallback, IndexFetchTableData, IndexInfo,
-    InvalidBuffer, ItemPointer, LockTupleMode, LockWaitPolicy, MultiXactId, NBuffers, Oid,
-    ParallelBlockTableScanDesc, ParallelBlockTableScanDescData, ParallelBlockTableScanWorkerData,
-    ParallelTableScanDesc, ParallelTableScanDescData, ReadStream, RelFileLocator, Relation,
-    RelationData, RelationGetNumberOfBlocksInFork, RelationIncrementReferenceCount, ReleaseBuffer,
-    SampleScanState, ScanDirection, ScanKey, ScanKeyData, Snapshot, SnapshotData, TM_FailureData,
-    TM_IndexDeleteOp, TM_Result, TTSOpsBufferHeapTuple, TU_UpdateIndexes, TableScanDesc,
-    TransactionId, TupleTableSlot, TupleTableSlotOps, VacuumParams, ValidateIndexState, smgrnblocks, RelationGetSmgr,
-    BLCKSZ
+    palloc, read_stream_begin_relation, read_stream_end, read_stream_reset, smgrnblocks,
+    BlockNumber, BufferAccessStrategy, BufferAccessStrategyData, BufferIsValid,
+    BulkInsertStateData, CommandId, ForkNumber, HeapScanDesc, HeapScanDescData, IndexBuildCallback,
+    IndexFetchTableData, IndexInfo, InvalidBuffer, ItemPointer, LockTupleMode, LockWaitPolicy,
+    MultiXactId, NBuffers, Oid, ParallelBlockTableScanDesc, ParallelBlockTableScanDescData,
+    ParallelBlockTableScanWorkerData, ParallelTableScanDesc, ParallelTableScanDescData, ReadStream,
+    RelFileLocator, Relation, RelationData, RelationGetNumberOfBlocksInFork, RelationGetSmgr,
+    RelationIncrementReferenceCount, ReleaseBuffer, SampleScanState, ScanDirection, ScanKey,
+    ScanKeyData, Snapshot, SnapshotData, TM_FailureData, TM_IndexDeleteOp, TM_Result,
+    TTSOpsBufferHeapTuple, TU_UpdateIndexes, TableScanDesc, TransactionId, TupleTableSlot,
+    TupleTableSlotOps, VacuumParams, ValidateIndexState, BLCKSZ,
 };
 use pgrx::pg_sys::BufferAccessStrategyType::BAS_BULKREAD;
 use pgrx::pg_sys::ScanDirection::ForwardScanDirection;
