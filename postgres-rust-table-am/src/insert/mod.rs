@@ -20,6 +20,7 @@ use pgrx::pg_sys::{
     RelationExtensionLockWaiterCount,
 };
 
+use crate::include::general::Assert;
 use crate::include::relaion_macro::*;
 use pgrx::prelude::*;
 use std::cmp::{max, min};
@@ -301,6 +302,8 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
     let mut pageFreeSpace: usize = 0;
     let num_pages = if num_pages <= 0 { 1 } else { num_pages };
 
+    Assert(otherBuffer == InvalidBuffer as i32 || state.is_null());
+
     if len > MaxHeapTupleSize!() {
         ereport!(
             PgLogLevel::ERROR,
@@ -456,7 +459,7 @@ pub unsafe extern "C-unwind" fn RelationGetBufferForTuple(
 
         pageFreeSpace = PageGetHeapFreeSpace(page);
 
-        // TODO: implement this, here must be either error or goto loop statement
+
         if len > pageFreeSpace {
             if unlockedTargetBuffer {
                 if otherBuffer != InvalidBuffer as i32 {

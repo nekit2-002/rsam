@@ -406,7 +406,8 @@ unsafe extern "C-unwind" fn tuple_insert(
     (*slot).tts_tableOid = (*rel).rd_id;
     (*tuple).t_tableOid = (*rel).rd_id;
 
-    heap_insert(rel, tuple, cid, options, bistate);
+    // heap_insert(rel, tuple, cid, options, bistate);
+    heap_insert(rel, tuple, cid, options, std::ptr::null_mut());
     ItemPointerCopy(&raw const (*tuple).t_self, &raw mut (*slot).tts_tid);
 
     if shouldFree {
