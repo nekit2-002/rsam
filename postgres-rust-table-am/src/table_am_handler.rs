@@ -12,7 +12,8 @@ use pg_sys::{
     RelationData, RelationGetNumberOfBlocksInFork, RelationIncrementReferenceCount, ReleaseBuffer,
     SampleScanState, ScanDirection, ScanKey, ScanKeyData, Snapshot, SnapshotData, TM_FailureData,
     TM_IndexDeleteOp, TM_Result, TTSOpsBufferHeapTuple, TU_UpdateIndexes, TableScanDesc,
-    TransactionId, TupleTableSlot, TupleTableSlotOps, VacuumParams, ValidateIndexState,
+    TransactionId, TupleTableSlot, TupleTableSlotOps, VacuumParams, ValidateIndexState, smgrnblocks, RelationGetSmgr,
+    BLCKSZ
 };
 use pgrx::pg_sys::BufferAccessStrategyType::BAS_BULKREAD;
 use pgrx::pg_sys::ScanDirection::ForwardScanDirection;
@@ -24,7 +25,7 @@ use pgrx::pg_sys::{
 };
 use pgrx::{
     pg_sys::{
-        ForkNumber::MAIN_FORKNUM,
+        ForkNumber::*,
         ReadStreamBlockNumberCB,
         ScanOptions::{SO_ALLOW_PAGEMODE, SO_ALLOW_STRAT, SO_TYPE_SEQSCAN},
         SnapshotType::{SNAPSHOT_HISTORIC_MVCC, SNAPSHOT_MVCC},
@@ -602,8 +603,17 @@ unsafe extern "C-unwind" fn index_validate_scan(
 }
 
 #[pg_guard]
-unsafe extern "C-unwind" fn relation_size(_rel: Relation, _fork_number: ForkNumber::Type) -> u64 {
-    todo!("relation_size")
+unsafe extern "C-unwind" fn relation_size(rel: Relation, fork_number: ForkNumber::Type) -> u64 {
+    let mut nblocks: u64 = 0;
+    if fork_number == InvalidForkNumber {
+        for i in 0..INIT_FORKNUM {
+            nblocks += smgrnblocks(RelationGetSmgr(rel), i) as u64;
+        }
+    } else {
+        nblocks = smgrnblocks(RelationGetSmgr(rel), fork_number) as u64;
+    }
+
+    nblocks * BLCKSZ as u64
 }
 
 #[pg_guard]
