@@ -1,43 +1,18 @@
 use pg_sys::{
-    check_for_interrupts,
-    heap_getattr,
-    heap_prepare_pagescan,
-    read_stream_next_buffer,
-    read_stream_reset,
-    BufferGetBlockNumber,
-    BufferGetPage,
-    BufferIsValid,
-    DatumGetBool,
-    FirstOffsetNumber,
-    FunctionCall2Coll,
-    HeapScanDesc,
-    HeapScanDescData,
-    HeapTuple,
-    HeapTupleSatisfiesVisibility, // todo: implement this
-    InvalidBlockNumber,
-    InvalidBuffer,
-    ItemId,
-    ItemPointerSet,
-    ItemPointerSetBlockNumber,
-    ItemPointerSetOffsetNumber,
-    LockBuffer,
-    OffsetNumber,
-    Page,
-    PageGetItem,
-    PageGetItemId,
-    PageGetMaxOffsetNumber,
-    ReleaseBuffer,
-    ScanKeyData,
-    TupleDesc,
-    BUFFER_LOCK_SHARE,
-    BUFFER_LOCK_UNLOCK,
-    SK_ISNULL,
+    check_for_interrupts, heap_getattr, heap_prepare_pagescan, read_stream_next_buffer,
+    read_stream_reset, BufferGetBlockNumber, BufferGetPage, BufferIsValid, DatumGetBool,
+    FirstOffsetNumber, FunctionCall2Coll, HeapScanDesc, HeapScanDescData, HeapTuple,
+    InvalidBlockNumber, InvalidBuffer, ItemId, ItemPointerSet, ItemPointerSetBlockNumber,
+    ItemPointerSetOffsetNumber, LockBuffer, OffsetNumber, Page, PageGetItem, PageGetItemId,
+    PageGetMaxOffsetNumber, ReleaseBuffer, ScanKeyData, TupleDesc, BUFFER_LOCK_SHARE,
+    BUFFER_LOCK_UNLOCK, SK_ISNULL, HeapTupleSatisfiesVisibility
 };
 
 use crate::include::general::*;
 use pg_sys::ScanDirection::*;
-use pgrx::prelude::*;
+use pgrx::{pg_sys::ScanDirection, prelude::*};
 use std::cmp::min;
+use crate::scan::visibility::*;
 
 #[macro_export]
 macro_rules! partial_loop {
@@ -215,16 +190,20 @@ pub unsafe extern "C-unwind" fn heap_gettup_pagemode(
 }
 
 #[pg_guard]
+// ! this function has bug
 unsafe extern "C-unwind" fn heap_gettup_continue_page(
     scan: HeapScanDesc,
-    scandir: i32,
+    scandir: ScanDirection::Type,
     lines_left: *mut i32,
     line_offset: *mut OffsetNumber,
 ) -> Page {
+    Assert((*scan).rs_inited);
+    Assert(BufferIsValid((*scan).rs_cbuf));
+
     let page = BufferGetPage((*scan).rs_cbuf);
     if scandir == ForwardScanDirection {
         *line_offset = OffsetNumberNext!((*scan).rs_coffset);
-        *lines_left = (PageGetMaxOffsetNumber(page) - (*line_offset) + 1) as i32;
+        *lines_left = PageGetMaxOffsetNumber(page) as i32 - (*line_offset as i32) + 1;
     } else {
         *line_offset = min(
             PageGetMaxOffsetNumber(page),
@@ -288,7 +267,7 @@ pub unsafe extern "C-unwind" fn heap_gettup(
         {
             while lines_left > 0 {
                 let lpp = PageGetItemId(page, line_offset);
-                if ItemIdIsNormal!(lpp) {
+                if !ItemIdIsNormal!(lpp) {
                     lines_left -= 1;
                     line_offset += dir as u16;
                     continue;
@@ -298,11 +277,13 @@ pub unsafe extern "C-unwind" fn heap_gettup(
                 (*tuple).t_len = (*lpp).lp_len();
                 ItemPointerSet(&raw mut (*tuple).t_self, (*scan).rs_cblock, line_offset);
 
+                // let visible = tuple_satisfies_visibility(
                 let visible = HeapTupleSatisfiesVisibility(
                     tuple,
                     (*scan).rs_base.rs_snapshot,
                     (*scan).rs_cbuf,
                 );
+
                 if !visible {
                     lines_left -= 1;
                     line_offset += dir as u16;
