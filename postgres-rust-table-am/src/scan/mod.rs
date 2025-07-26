@@ -6,6 +6,7 @@ use pgrx::pg_sys::{
 };
 use pgrx::prelude::*;
 pub mod fetcher;
+pub mod visibility;
 
 #[pg_guard]
 unsafe extern "C-unwind" fn heapgettup_initial_block(

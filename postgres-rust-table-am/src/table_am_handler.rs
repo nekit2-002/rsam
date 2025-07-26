@@ -289,11 +289,11 @@ unsafe extern "C-unwind" fn scan_getnextslot(
     slot: *mut TupleTableSlot,
 ) -> bool {
     let scan = sscan as HeapScanDesc;
-    if ((*sscan).rs_flags & SO_ALLOW_PAGEMODE) != 0 {
-        heap_gettup_pagemode(scan, direction, (*sscan).rs_nkeys, (*sscan).rs_key);
-    } else {
+    // if ((*sscan).rs_flags & SO_ALLOW_PAGEMODE) != 0 {
+    //     heap_gettup_pagemode(scan, direction, (*sscan).rs_nkeys, (*sscan).rs_key);
+    // } else {
         heap_gettup(scan, direction, (*sscan).rs_nkeys, (*sscan).rs_key);
-    }
+    // }
 
     if (*scan).rs_ctup.t_data.is_null() {
         let clear = (*(*slot).tts_ops)

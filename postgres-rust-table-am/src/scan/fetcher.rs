@@ -277,8 +277,8 @@ pub unsafe extern "C-unwind" fn heap_gettup(
                 (*tuple).t_len = (*lpp).lp_len();
                 ItemPointerSet(&raw mut (*tuple).t_self, (*scan).rs_cblock, line_offset);
 
-                // let visible = tuple_satisfies_visibility(
-                let visible = HeapTupleSatisfiesVisibility(
+                let visible = tuple_satisfies_visibility(
+                // let visible = HeapTupleSatisfiesVisibility(
                     tuple,
                     (*scan).rs_base.rs_snapshot,
                     (*scan).rs_cbuf,

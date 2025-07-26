@@ -530,13 +530,13 @@ pub unsafe extern "C-unwind" fn relation_put_tuple(
         true
     );
 
-    // if offnum == InvalidOffsetNumber {
-        // ereport!(
-        //     PgLogLevel::PANIC,
-        //     PgSqlErrorCode::ERRCODE_ASSERT_FAILURE,
-        //     "failed to add tuple to page"
-        // );
-    // }
+    if offnum == InvalidOffsetNumber {
+        ereport!(
+            PgLogLevel::PANIC,
+            PgSqlErrorCode::ERRCODE_ASSERT_FAILURE,
+            "failed to add tuple to page"
+        );
+    }
 
     ItemPointerSet(
         &raw mut (*tuple).t_self,
