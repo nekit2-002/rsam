@@ -9,6 +9,7 @@ use pg_sys::{
 };
 
 use crate::include::general::*;
+use crate::include::relaion_macro::RelationGetDescr;
 use pg_sys::ScanDirection::*;
 use pgrx::{pg_sys::ScanDirection, prelude::*};
 use std::cmp::min;
@@ -26,20 +27,6 @@ macro_rules! partial_loop {
             $from_label
         }
       }
-    };
-}
-
-#[macro_export]
-macro_rules! RelationGetDescr {
-    ($rel:expr) => {
-        (*$rel).rd_att
-    };
-}
-
-#[macro_export]
-macro_rules! ItemIdIsNormal {
-    ($itemId:expr) => {
-        (*$itemId).lp_flags() == pgrx::pg_sys::LP_NORMAL
     };
 }
 

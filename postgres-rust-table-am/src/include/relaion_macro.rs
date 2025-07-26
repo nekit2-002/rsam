@@ -61,3 +61,21 @@ macro_rules! RelationIsLocal {
 }
 
 pub use RelationIsLocal;
+
+#[macro_export]
+macro_rules! RelationGetDescr {
+    ($rel:expr) => {
+        (*$rel).rd_att
+    };
+}
+
+pub use RelationGetDescr;
+
+#[macro_export]
+macro_rules! RelationGetRelId {
+    ($rel:expr) => {
+        (*$rel).rd_id
+    };
+}
+
+pub use RelationGetRelId;

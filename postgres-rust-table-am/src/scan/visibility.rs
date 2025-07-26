@@ -31,7 +31,7 @@ unsafe extern "C-unwind" fn HeapTupleHeaderXminFrozen(tup: *const HeapTupleHeade
 
 #[pg_guard]
 #[allow(non_snake_case)]
-unsafe extern "C-unwind" fn xmax_is_locked_only(infomask: u16) -> bool {
+pub unsafe extern "C-unwind" fn xmax_is_locked_only(infomask: u16) -> bool {
     (infomask & HEAP_XMAX_LOCK_ONLY as u16 != 0)
         || (infomask & (HEAP_LOCK_MASK | HEAP_XMAX_IS_MULTI) as u16 == HEAP_XMAX_EXCL_LOCK as u16)
 }

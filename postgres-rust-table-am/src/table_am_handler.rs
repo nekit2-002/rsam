@@ -1,40 +1,55 @@
 use crate::am_handler_port::{new_table_am_routine, TableAmArgs, TableAmHandler, TableAmRoutine};
+use crate::delete::*;
+use crate::include::general::*;
+use crate::include::relaion_macro::*;
 use crate::insert::*;
-use crate::scan::fetcher::{self, heap_gettup, heap_gettup_pagemode};
+use crate::scan::fetcher::{heap_gettup, heap_gettup_pagemode};
+use crate::scan::visibility::*;
 use crate::scan::*;
+
+// import types
 use pg_sys::{
-    palloc, read_stream_begin_relation, read_stream_end, read_stream_reset, smgrnblocks,
-    BlockNumber, BufferAccessStrategy, BufferAccessStrategyData, BufferIsValid,
-    BulkInsertStateData, CommandId, ForkNumber, HeapScanDesc, HeapScanDescData, IndexBuildCallback,
-    IndexFetchTableData, IndexInfo, InvalidBuffer, ItemPointer, LockTupleMode, LockWaitPolicy,
-    MultiXactId, NBuffers, Oid, ParallelBlockTableScanDesc, ParallelBlockTableScanDescData,
-    ParallelBlockTableScanWorkerData, ParallelTableScanDesc, ParallelTableScanDescData, ReadStream,
-    RelFileLocator, Relation, RelationData, RelationGetNumberOfBlocksInFork, RelationGetSmgr,
-    RelationIncrementReferenceCount, ReleaseBuffer, SampleScanState, ScanDirection, ScanKey,
-    ScanKeyData, Snapshot, SnapshotData, TM_FailureData, TM_IndexDeleteOp, TM_Result,
-    TTSOpsBufferHeapTuple, TU_UpdateIndexes, TableScanDesc, TransactionId, TupleTableSlot,
-    TupleTableSlotOps, VacuumParams, ValidateIndexState, BLCKSZ,
-};
-use pgrx::pg_sys::BufferAccessStrategyType::BAS_BULKREAD;
-use pgrx::pg_sys::ScanDirection::ForwardScanDirection;
-use pgrx::pg_sys::ScanOptions::SO_ALLOW_SYNC;
-use pgrx::pg_sys::{
-    pfree, synchronize_seqscans, ExecFetchSlotHeapTuple, ExecStoreBufferHeapTuple,
-    FreeAccessStrategy, GetAccessStrategy, InvalidBlockNumber, ItemPointerCopy,
-    ItemPointerSetInvalid, RelationDecrementReferenceCount,
-};
-use pgrx::{
-    pg_sys::{
-        ForkNumber::*,
-        ReadStreamBlockNumberCB,
-        ScanOptions::{SO_ALLOW_PAGEMODE, SO_ALLOW_STRAT, SO_TYPE_SEQSCAN},
-        SnapshotType::{SNAPSHOT_HISTORIC_MVCC, SNAPSHOT_MVCC},
-        READ_STREAM_SEQUENTIAL, RELPERSISTENCE_TEMP,
-    },
-    prelude::*,
+    BlockNumber, BufferAccessStrategy, BufferAccessStrategyData, BulkInsertStateData, CommandId,
+    ForkNumber, HeapScanDesc, HeapScanDescData, HeapTupleData, IndexBuildCallback,
+    IndexFetchTableData, IndexInfo, ItemPointer, LockTupleMode, LockWaitPolicy, MultiXactId, Oid,
+    ParallelBlockTableScanDesc, ParallelBlockTableScanDescData, ParallelBlockTableScanWorkerData,
+    ParallelTableScanDesc, ParallelTableScanDescData, ReadStream, ReadStreamBlockNumberCB,
+    RelFileLocator, Relation, RelationData, SampleScanState, ScanDirection, ScanKey, ScanKeyData,
+    Snapshot, SnapshotData, TM_FailureData, TM_IndexDeleteOp, TM_Result, TU_UpdateIndexes,
+    TableScanDesc, TransactionId, TupleTableSlot, TupleTableSlotOps, VacuumParams,
+    ValidateIndexState,
 };
 
-use crate::include::general::*;
+// import constants
+use pg_sys::{
+    synchronize_seqscans, InvalidBlockNumber, InvalidBuffer, NBuffers, TTSOpsBufferHeapTuple,
+    BLCKSZ, BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI,
+    READ_STREAM_SEQUENTIAL, RELPERSISTENCE_TEMP,
+};
+use pgrx::pg_sys::BufferAccessStrategyType::BAS_BULKREAD;
+use pgrx::pg_sys::LockTupleMode::LockTupleExclusive;
+use pgrx::pg_sys::LockWaitPolicy::LockWaitBlock;
+use pgrx::pg_sys::ScanOptions::*;
+use pgrx::pg_sys::SnapshotType::*;
+use pgrx::pg_sys::TM_Result::*;
+use pgrx::pg_sys::{ForkNumber::*, InvalidCommandId};
+use pgrx::pg_sys::{ScanDirection::*, UnlockTuple};
+
+use pgrx::pg_sys::XLTW_Oper::XLTW_Delete;
+// import functions
+use pgrx::pg_sys::{
+    palloc, pfree, read_stream_begin_relation, read_stream_end, read_stream_reset, smgrnblocks,
+    visibilitymap_pin, BufferGetPage, BufferIsValid, ExecFetchSlotHeapTuple,
+    ExecStoreBufferHeapTuple, FreeAccessStrategy, GetAccessStrategy, GetCurrentTransactionId,
+    HeapTupleHeaderGetCmax, HeapTupleHeaderIsOnlyLocked, HeapTupleSatisfiesUpdate,
+    IsInParallelMode, ItemPointerCopy, ItemPointerEquals, ItemPointerGetBlockNumber,
+    ItemPointerGetOffsetNumber, ItemPointerIsValid, ItemPointerSetInvalid, LockBuffer, PageGetItem,
+    PageGetItemId, PageIsAllVisible, ReadBuffer, RelationDecrementReferenceCount,
+    RelationGetNumberOfBlocksInFork, RelationGetSmgr, RelationIncrementReferenceCount,
+    ReleaseBuffer, TransactionIdIsCurrentTransactionId, UnlockReleaseBuffer, XactLockTableWait,
+    HeapTupleHeaderAdjustCmax,
+};
+use pgrx::prelude::*;
 
 #[macro_export]
 macro_rules! IsMVCCSnapshot {
@@ -292,7 +307,7 @@ unsafe extern "C-unwind" fn scan_getnextslot(
     // if ((*sscan).rs_flags & SO_ALLOW_PAGEMODE) != 0 {
     //     heap_gettup_pagemode(scan, direction, (*sscan).rs_nkeys, (*sscan).rs_key);
     // } else {
-        heap_gettup(scan, direction, (*sscan).rs_nkeys, (*sscan).rs_key);
+    heap_gettup(scan, direction, (*sscan).rs_nkeys, (*sscan).rs_key);
     // }
 
     if (*scan).rs_ctup.t_data.is_null() {
@@ -451,16 +466,141 @@ unsafe extern "C-unwind" fn multi_insert(
 
 #[pg_guard]
 unsafe extern "C-unwind" fn tuple_delete(
-    _rel: Relation,
-    _tid: ItemPointer,
-    _cid: CommandId,
-    _snapshot: Snapshot,
-    _crosscheck: Snapshot,
-    _wait: bool,
-    _tmfd: *mut TM_FailureData,
-    _changing_part: bool,
+    rel: Relation,
+    tid: ItemPointer,
+    cid: CommandId,
+    snapshot: Snapshot,
+    crosscheck: Snapshot,
+    wait: bool,
+    tmfd: *mut TM_FailureData,
+    changing_part: bool,
 ) -> TM_Result::Type {
-    todo!("tuple_delete")
+    let xid = GetCurrentTransactionId();
+    let mut vmbuffer = InvalidBuffer as i32;
+
+    Assert(ItemPointerIsValid(tid));
+    if IsInParallelMode() {
+        ereport!(
+            PgLogLevel::ERROR,
+            PgSqlErrorCode::ERRCODE_INVALID_TRANSACTION_STATE,
+            "cannot delete tuples during a parallel operation"
+        )
+    }
+
+    let block = ItemPointerGetBlockNumber(tid);
+    let buffer = ReadBuffer(rel, block);
+    let page = BufferGetPage(buffer);
+    if PageIsAllVisible(page) {
+        visibilitymap_pin(rel, block, &raw mut vmbuffer);
+    }
+
+    LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
+    let lp = PageGetItemId(page, ItemPointerGetOffsetNumber(tid));
+    Assert(ItemIdIsNormal!(lp));
+
+    let mut tp: HeapTupleData = HeapTupleData {
+        t_len: (*lp).lp_len(),
+        t_self: *tid,
+        t_tableOid: RelationGetRelId!(rel),
+        t_data: PageGetItem(page, lp).cast(),
+    };
+
+    let (mut result, have_tuple_lock) = loop {
+        let mut have_tuple_lock = false;
+
+        if vmbuffer == InvalidBuffer as i32 && PageIsAllVisible(page) {
+            LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+            visibilitymap_pin(rel, block, &raw mut vmbuffer);
+            LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
+        }
+        let mut result = HeapTupleSatisfiesUpdate(&raw mut tp, cid, buffer);
+        if result == TM_Invisible {
+            UnlockReleaseBuffer(buffer);
+            ereport!(
+                PgLogLevel::ERROR,
+                PgSqlErrorCode::ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE,
+                "attempted to delete invisible tuple!"
+            )
+        } else if result == TM_BeingModified && wait {
+            let xwait = (*tp.t_data).t_choice.t_heap.t_xmax;
+            let infomask = (*tp.t_data).t_infomask;
+            if infomask & HEAP_XMAX_IS_MULTI as u16 != 0 {
+            } else if !TransactionIdIsCurrentTransactionId(xwait) {
+                LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+                aquire_tuplock(
+                    rel,
+                    &raw mut (tp.t_self),
+                    LockTupleExclusive,
+                    LockWaitBlock,
+                    &raw mut have_tuple_lock,
+                );
+
+                XactLockTableWait(xwait, rel, &raw mut tp.t_self, XLTW_Delete);
+                LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
+
+                if (vmbuffer == InvalidBuffer as i32 && PageIsAllVisible(page))
+                    || xmax_infomask_changed((*tp.t_data).t_infomask, infomask)
+                    || !((*tp.t_data).t_choice.t_heap.t_xmax == xwait)
+                {
+                    continue;
+                }
+
+                UpdateXmaxHintBits(tp.t_data, buffer, xwait);
+            }
+
+            result = if (*tp.t_data).t_infomask & HEAP_XMAX_INVALID as u16 != 0
+                || xmax_is_locked_only((*tp.t_data).t_infomask)
+                || HeapTupleHeaderIsOnlyLocked(tp.t_data)
+            {
+                TM_Ok
+            } else if !ItemPointerEquals(&raw mut tp.t_self, &raw mut (*tp.t_data).t_ctid) {
+                TM_Updated
+            } else {
+                TM_Deleted
+            }
+        }
+
+        break (result, have_tuple_lock);
+    };
+
+    if result != TM_Ok {
+        Assert(
+            result == TM_SelfModified
+                || result == TM_Updated
+                || result == TM_Deleted
+                || result == TM_BeingModified,
+        );
+    }
+
+    if !crosscheck.is_null() && result == TM_Ok {
+        if !tuple_satisfies_visibility(&raw mut tp, crosscheck, buffer) {
+            result = TM_Updated;
+        }
+    }
+
+    if result != TM_Ok {
+        (*tmfd).ctid = (*tp.t_data).t_ctid;
+        (*tmfd).xmax = tuple_header_get_update_xid(tp.t_data);
+        (*tmfd).cmax = if result == TM_SelfModified {
+            HeapTupleHeaderGetCmax(tp.t_data)
+        } else {
+            InvalidCommandId
+        };
+
+        UnlockReleaseBuffer(buffer);
+        if have_tuple_lock {
+            UnlockTuple(rel, &raw mut (tp.t_self), LockTupleExclusive as i32);
+        }
+
+        if vmbuffer != InvalidBuffer as i32 {
+            ReleaseBuffer(vmbuffer);
+        }
+        return result;
+    }
+
+
+
+    TM_Ok
 }
 
 #[pg_guard]

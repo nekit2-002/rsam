@@ -4,6 +4,7 @@ mod table_am_handler;
 mod scan;
 mod insert;
 mod include;
+mod delete;
 
 pgrx::pg_module_magic!();
 
