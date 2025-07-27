@@ -1,7 +1,8 @@
 #[macro_export]
 macro_rules! RelationGetTargetPageFreeSpace {
     ($rel:expr, $defaultff: expr) => {
-        pgrx::pg_sys::BLCKSZ as usize * (100 - RelationGetFillFactor!($rel, $defaultff) / 100) as usize
+        pgrx::pg_sys::BLCKSZ as usize
+            * (100 - RelationGetFillFactor!($rel, $defaultff) / 100) as usize
     };
 }
 
@@ -79,3 +80,14 @@ macro_rules! RelationGetRelId {
 }
 
 pub use RelationGetRelId;
+
+#[macro_export]
+macro_rules! RelationIsLogicallyLogged {
+    ($rel:expr) => {
+        pgrx::pg_sys::wal_level >= pg_sys::WalLevel::WAL_LEVEL_LOGICAL as i32
+            && (*(*$rel).rd_rel).relkind != pgrx::pg_sys::RELKIND_FOREIGN_TABLE as i8
+            && !pgrx::pg_sys::IsCatalogRelation($rel)
+    };
+}
+
+pub use RelationIsLogicallyLogged;

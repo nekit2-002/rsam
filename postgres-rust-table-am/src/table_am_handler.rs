@@ -1,11 +1,11 @@
 use crate::am_handler_port::{new_table_am_routine, TableAmArgs, TableAmHandler, TableAmRoutine};
-use crate::delete::*;
 use crate::include::general::*;
 use crate::include::relaion_macro::*;
-use crate::insert::*;
 use crate::scan::fetcher::{heap_gettup, heap_gettup_pagemode};
 use crate::scan::visibility::*;
 use crate::scan::*;
+use crate::{delete::*, START_CRIT_SECTION};
+use crate::{insert::*, END_CRIT_SECTION};
 
 // import types
 use pg_sys::{
@@ -29,25 +29,29 @@ use pg_sys::{
 use pgrx::pg_sys::BufferAccessStrategyType::BAS_BULKREAD;
 use pgrx::pg_sys::LockTupleMode::LockTupleExclusive;
 use pgrx::pg_sys::LockWaitPolicy::LockWaitBlock;
-use pgrx::pg_sys::ScanOptions::*;
-use pgrx::pg_sys::SnapshotType::*;
-use pgrx::pg_sys::TM_Result::*;
+use pgrx::pg_sys::{
+    visibilitymap_clear, MarkBufferDirty, TM_Result::*, HEAP_HOT_UPDATED, HEAP_KEYS_UPDATED,
+    HEAP_MOVED, HEAP_XMAX_BITS, VISIBILITYMAP_VALID_BITS,
+};
 use pgrx::pg_sys::{ForkNumber::*, InvalidCommandId};
+use pgrx::pg_sys::{InvalidTransactionId, ScanOptions::*};
+use pgrx::pg_sys::{PageClearAllVisible, SnapshotType::*};
 use pgrx::pg_sys::{ScanDirection::*, UnlockTuple};
 
 use pgrx::pg_sys::XLTW_Oper::XLTW_Delete;
 // import functions
 use pgrx::pg_sys::{
-    palloc, pfree, read_stream_begin_relation, read_stream_end, read_stream_reset, smgrnblocks,
-    visibilitymap_pin, BufferGetPage, BufferIsValid, ExecFetchSlotHeapTuple,
-    ExecStoreBufferHeapTuple, FreeAccessStrategy, GetAccessStrategy, GetCurrentTransactionId,
-    HeapTupleHeaderGetCmax, HeapTupleHeaderIsOnlyLocked, HeapTupleSatisfiesUpdate,
-    IsInParallelMode, ItemPointerCopy, ItemPointerEquals, ItemPointerGetBlockNumber,
-    ItemPointerGetOffsetNumber, ItemPointerIsValid, ItemPointerSetInvalid, LockBuffer, PageGetItem,
-    PageGetItemId, PageIsAllVisible, ReadBuffer, RelationDecrementReferenceCount,
-    RelationGetNumberOfBlocksInFork, RelationGetSmgr, RelationIncrementReferenceCount,
-    ReleaseBuffer, TransactionIdIsCurrentTransactionId, UnlockReleaseBuffer, XactLockTableWait,
-    HeapTupleHeaderAdjustCmax,
+    palloc, pfree, pgstat_count_heap_delete, read_stream_begin_relation, read_stream_end,
+    read_stream_reset, smgrnblocks, visibilitymap_pin, BufferGetBlockNumber, BufferGetPage,
+    BufferIsValid, ExecFetchSlotHeapTuple, ExecStoreBufferHeapTuple, FreeAccessStrategy,
+    GetAccessStrategy, GetCurrentTransactionId, HeapTupleHeaderAdjustCmax, HeapTupleHeaderGetCmax,
+    HeapTupleHeaderIsOnlyLocked, HeapTupleSatisfiesUpdate, IsInParallelMode, ItemPointerCopy,
+    ItemPointerEquals, ItemPointerGetBlockNumber, ItemPointerGetOffsetNumber,
+    ItemPointerIndicatesMovedPartitions, ItemPointerIsValid, ItemPointerSetInvalid, LockBuffer,
+    MultiXactIdSetOldestMember, PageGetItem, PageGetItemId, PageIsAllVisible, ReadBuffer,
+    RelationDecrementReferenceCount, RelationGetNumberOfBlocksInFork, RelationGetSmgr,
+    RelationIncrementReferenceCount, ReleaseBuffer, TransactionIdIsCurrentTransactionId,
+    UnlockReleaseBuffer, XactLockTableWait,
 };
 use pgrx::prelude::*;
 
@@ -468,7 +472,7 @@ unsafe extern "C-unwind" fn multi_insert(
 unsafe extern "C-unwind" fn tuple_delete(
     rel: Relation,
     tid: ItemPointer,
-    cid: CommandId,
+    mut cid: CommandId,
     snapshot: Snapshot,
     crosscheck: Snapshot,
     wait: bool,
@@ -570,6 +574,11 @@ unsafe extern "C-unwind" fn tuple_delete(
                 || result == TM_Deleted
                 || result == TM_BeingModified,
         );
+        Assert((*tp.t_data).t_infomask & HEAP_XMAX_INVALID as u16 == 0);
+        Assert(
+            result != TM_Updated
+                || !ItemPointerEquals(&raw mut (tp.t_self), &raw mut (*tp.t_data).t_ctid),
+        );
     }
 
     if !crosscheck.is_null() && result == TM_Ok {
@@ -598,7 +607,77 @@ unsafe extern "C-unwind" fn tuple_delete(
         return result;
     }
 
+    let mut is_combo = false;
+    HeapTupleHeaderAdjustCmax(tp.t_data, &raw mut cid, &raw mut is_combo);
+    let mut old_key_copied = false;
+    let old_key_tuple = extract_replica_identity(rel, &raw mut tp, true, &raw mut old_key_copied);
 
+    MultiXactIdSetOldestMember();
+    let mut new_xmax = InvalidTransactionId;
+    let mut new_infomask = 0;
+    let mut new_infomask2 = 0;
+    compute_new_xmax_infomask(
+        (*tp.t_data).t_choice.t_heap.t_xmax,
+        (*tp.t_data).t_infomask,
+        (*tp.t_data).t_infomask2,
+        xid,
+        LockTupleExclusive,
+        true,
+        &raw mut new_xmax,
+        &raw mut new_infomask,
+        &raw mut new_infomask2,
+    );
+
+    START_CRIT_SECTION!();
+
+    PageSetPrunable(page, xid);
+    let all_visible_cleared = false;
+    if PageIsAllVisible(page) {
+        all_visible_cleared = true;
+        PageClearAllVisible(page);
+        visibilitymap_clear(
+            rel,
+            BufferGetBlockNumber(buffer),
+            vmbuffer,
+            VISIBILITYMAP_VALID_BITS as u8,
+        );
+    }
+
+    (*tp.t_data).t_infomask &= !(HEAP_XMAX_BITS | HEAP_MOVED) as u16;
+    (*tp.t_data).t_infomask2 &= !HEAP_KEYS_UPDATED as u16;
+    (*tp.t_data).t_infomask |= new_infomask;
+    (*tp.t_data).t_infomask2 |= new_infomask2;
+    (*tp.t_data).t_infomask2 |= HEAP_HOT_UPDATED as u16;
+    (*tp.t_data).t_choice.t_heap.t_xmax = new_xmax;
+    header_set_cmax(tp.t_data, cid, is_combo);
+    (*tp.t_data).t_ctid = tp.t_self;
+
+    if changing_part {
+        ItemPointerIndicatesMovedPartitions(&raw const (*tp.t_data).t_ctid);
+    }
+
+    MarkBufferDirty(buffer);
+    // TODO: implement write ahead log stuff
+    // if RelationNeedsWal!(rel) {}
+
+    END_CRIT_SECTION!();
+
+    LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+    if vmbuffer != InvalidBuffer as i32 {
+        ReleaseBuffer(vmbuffer);
+    }
+
+    // TODO: implement deleting toast data if needed
+
+    ReleaseBuffer(buffer);
+    if have_tuple_lock {
+        UnlockTuple(rel, &raw mut (tp.t_self), LockTupleExclusive as i32);
+    }
+
+    pgstat_count_heap_delete(rel);
+    if old_key_copied && !old_key_tuple.is_null() {
+        pfree(old_key_tuple.cast());
+    }
 
     TM_Ok
 }
