@@ -23,7 +23,7 @@ use pgrx::pg_sys::{
     RelationExtensionLockWaiterCount,
 };
 
-use crate::include::general::Assert;
+use crate::include::general::*;
 use crate::include::relaion_macro::*;
 use pgrx::prelude::*;
 use std::cmp::{max, min};
@@ -54,22 +54,6 @@ macro_rules! SizeOfHeapTupleHeader {
 macro_rules! MinHeapTupleSize {
     () => {
         MAXALIGN(SizeOfHeapTupleHeader!())
-    };
-}
-
-#[macro_export]
-macro_rules! START_CRIT_SECTION {
-    () => {
-        CritSectionCount += 1;
-    };
-}
-
-#[macro_export]
-macro_rules! END_CRIT_SECTION {
-    () => {
-        if CritSectionCount > 0 {
-            CritSectionCount -= 1;
-        }
     };
 }
 

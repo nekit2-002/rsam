@@ -1,8 +1,8 @@
 // import types
 use pgrx::pg_sys::{
     Buffer, CommandId, Datum, HeapTupleData, HeapTupleHeaderData, ItemPointer, LockTupleMode,
-    LockWaitPolicy, MultiXactId, MultiXactStatus, Page, PageHeader, Relation, TransactionId,
-    LOCKMODE,
+    LockWaitPolicy, MultiXactId, MultiXactMember, MultiXactStatus, Page, PageHeader, Relation,
+    TransactionId, LOCKMODE,
 };
 
 //import constants
@@ -20,11 +20,11 @@ use pgrx::pg_sys::{
 
 // import functions
 use pgrx::pg_sys::{
-    bms_free, bms_is_member, heap_deform_tuple, heap_form_tuple, ConditionalLockTuple,
-    HeapTupleGetUpdateXid, HeapTupleSetHintBits, LockTuple, MultiXactIdCreate, MultiXactIdExpand,
-    MultiXactIdIsRunning, RelationGetIndexAttrBitmap, TransactionIdDidCommit,
-    TransactionIdIsCurrentTransactionId, TransactionIdIsInProgress, TransactionIdIsNormal,
-    TransactionIdPrecedes,
+    bms_free, bms_is_member, heap_deform_tuple, heap_form_tuple, pfree, ConditionalLockTuple,
+    GetMultiXactIdMembers, HeapTupleGetUpdateXid, HeapTupleSetHintBits, LockTuple,
+    MultiXactIdCreate, MultiXactIdExpand, MultiXactIdIsRunning, RelationGetIndexAttrBitmap,
+    TransactionIdDidCommit, TransactionIdIsCurrentTransactionId, TransactionIdIsInProgress,
+    TransactionIdIsNormal, TransactionIdPrecedes,
 };
 use pgrx::prelude::*;
 
@@ -91,6 +91,7 @@ fn HEAP_XMAX_IS_EXCL_LOCKED(mask: u16) -> bool {
 }
 
 #[pg_guard]
+#[allow(non_upper_case_globals)]
 pub unsafe extern "C-unwind" fn aquire_tuplock(
     rel: Relation,
     tid: ItemPointer,
@@ -174,11 +175,33 @@ pub unsafe extern "C-unwind" fn tuple_header_get_update_xid(
 }
 
 #[pg_guard]
+#[allow(non_snake_case)]
 pub unsafe extern "C-unwind" fn MultiXactIdGetUpdateXid(
     xmax: TransactionId,
     t_infomask: u16,
 ) -> TransactionId {
-    todo!("")
+    let mut update_xact = InvalidTransactionId;
+    Assert(t_infomask & HEAP_XMAX_LOCK_ONLY as u16 == 0);
+    Assert(t_infomask & HEAP_XMAX_IS_MULTI as u16 != 0);
+
+    let mut members: *mut MultiXactMember = std::ptr::null_mut();
+    let nmembers = GetMultiXactIdMembers(xmax, &raw mut members, false, false);
+    if nmembers > 0 {
+        // Here, as nmembers > 0, members is a valid C array and conversion nmembers to usize is safe
+        let members_slice = std::slice::from_raw_parts_mut(members, nmembers as usize);
+        for m in members_slice {
+            if m.status <= MultiXactStatusForUpdate {
+                continue;
+            }
+
+            Assert(update_xact == InvalidTransactionId);
+            update_xact = m.xid;
+        }
+
+        pfree(members.cast());
+    }
+
+    update_xact
 }
 
 #[pg_guard]
@@ -262,14 +285,65 @@ pub unsafe extern "C-unwind" fn extract_replica_identity(
 }
 
 #[pg_guard]
+#[allow(non_upper_case_globals)]
 pub unsafe extern "C-unwind" fn get_multi_xact_id_hint_bits(
     multi: MultiXactId,
     new_mask: *mut u16,
-    old_mask: *mut u16,
+    new_mask2: *mut u16,
 ) {
+    let mut bits = HEAP_XMAX_IS_MULTI as u16;
+    let mut bits2 = 0u16;
+    let mut has_update = false;
+    let mut strongest: LockTupleMode::Type = LockTupleKeyShare;
+    let mut members: *mut MultiXactMember = std::ptr::null_mut();
+    let nmembers = GetMultiXactIdMembers(multi, &raw mut members, false, false);
+
+    if nmembers > 0 {
+        let members_slice = std::slice::from_raw_parts_mut(members, nmembers as usize);
+        for m in members_slice {
+            let mode = MultiXactStatusLock[m.status as usize];
+            if mode > strongest {
+                strongest = mode;
+            }
+
+            match m.status {
+                MultiXactStatusForKeyShare => {}
+                MultiXactStatusForShare => {}
+                MultiXactStatusForNoKeyUpdate => {}
+                MultiXactStatusForUpdate => {
+                    bits2 |= HEAP_KEYS_UPDATED as u16;
+                }
+                MultiXactStatusNoKeyUpdate => {
+                    has_update = true;
+                }
+                MultiXactStatusUpdate => {
+                    bits2 |= HEAP_KEYS_UPDATED as u16;
+                    has_update = true;
+                }
+                _ => {}
+            }
+        }
+        pfree(members.cast());
+    }
+
+    if strongest == LockTupleExclusive || strongest == LockTupleNoKeyExclusive {
+        bits |= HEAP_XMAX_EXCL_LOCK;
+    } else if strongest == LockTupleShare {
+        bits |= HEAP_XMAX_SHR_LOCK as u16;
+    } else if strongest == LockTupleKeyShare {
+        bits |= HEAP_XMAX_KEYSHR_LOCK as u16;
+    }
+
+    if !has_update {
+        bits |= HEAP_XMAX_LOCK_ONLY as u16;
+    }
+
+    *new_mask = bits;
+    *new_mask2 = bits2;
 }
 
 #[pg_guard]
+#[allow(non_upper_case_globals)]
 pub unsafe extern "C-unwind" fn compute_new_xmax_infomask(
     xmax: TransactionId,
     old_infomask: u16,

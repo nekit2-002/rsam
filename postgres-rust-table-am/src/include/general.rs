@@ -18,3 +18,23 @@ macro_rules! ItemIdIsNormal {
 }
 
 pub use ItemIdIsNormal;
+
+#[macro_export]
+macro_rules! START_CRIT_SECTION {
+    () => {
+        pgrx::pg_sys::CritSectionCount += 1;
+    };
+}
+
+pub use START_CRIT_SECTION;
+
+#[macro_export]
+macro_rules! END_CRIT_SECTION {
+    () => {
+        if pgrx::pg_sys::CritSectionCount > 0 {
+            pgrx::pg_sys::CritSectionCount -= 1;
+        }
+    };
+}
+
+pub use END_CRIT_SECTION;

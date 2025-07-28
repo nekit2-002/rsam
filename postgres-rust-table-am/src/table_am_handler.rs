@@ -9,15 +9,14 @@ use crate::{insert::*, END_CRIT_SECTION};
 
 // import types
 use pg_sys::{
-    BlockNumber, BufferAccessStrategy, BufferAccessStrategyData, BulkInsertStateData, CommandId,
-    ForkNumber, HeapScanDesc, HeapScanDescData, HeapTupleData, IndexBuildCallback,
-    IndexFetchTableData, IndexInfo, ItemPointer, LockTupleMode, LockWaitPolicy, MultiXactId, Oid,
-    ParallelBlockTableScanDesc, ParallelBlockTableScanDescData, ParallelBlockTableScanWorkerData,
-    ParallelTableScanDesc, ParallelTableScanDescData, ReadStream, ReadStreamBlockNumberCB,
-    RelFileLocator, Relation, RelationData, SampleScanState, ScanDirection, ScanKey, ScanKeyData,
-    Snapshot, SnapshotData, TM_FailureData, TM_IndexDeleteOp, TM_Result, TU_UpdateIndexes,
-    TableScanDesc, TransactionId, TupleTableSlot, TupleTableSlotOps, VacuumParams,
-    ValidateIndexState,
+    BlockNumber, BufferAccessStrategy, BulkInsertStateData, CommandId, ForkNumber, HeapScanDesc,
+    HeapScanDescData, HeapTupleData, IndexBuildCallback, IndexFetchTableData, IndexInfo,
+    ItemPointer, LockTupleMode, LockWaitPolicy, MultiXactId, Oid, ParallelBlockTableScanDesc,
+    ParallelBlockTableScanDescData, ParallelBlockTableScanWorkerData, ParallelTableScanDesc,
+    ParallelTableScanDescData, ReadStream, ReadStreamBlockNumberCB, RelFileLocator, Relation,
+    RelationData, SampleScanState, ScanDirection, ScanKey, ScanKeyData, Snapshot, SnapshotData,
+    TM_FailureData, TM_IndexDeleteOp, TM_Result, TU_UpdateIndexes, TableScanDesc, TransactionId,
+    TupleTableSlot, TupleTableSlotOps, VacuumParams, ValidateIndexState,
 };
 
 // import constants
@@ -418,7 +417,7 @@ unsafe extern "C-unwind" fn tuple_insert(
     slot: *mut TupleTableSlot,
     cid: CommandId,
     options: ::core::ffi::c_int,
-    bistate: *mut BulkInsertStateData,
+    _bistate: *mut BulkInsertStateData,
 ) {
     let mut shouldFree = true;
     let tuple = ExecFetchSlotHeapTuple(slot, true, &raw mut shouldFree);
@@ -472,13 +471,14 @@ unsafe extern "C-unwind" fn multi_insert(
 unsafe extern "C-unwind" fn tuple_delete(
     rel: Relation,
     tid: ItemPointer,
-    mut cid: CommandId,
+    cid: CommandId,
     snapshot: Snapshot,
     crosscheck: Snapshot,
     wait: bool,
     tmfd: *mut TM_FailureData,
     changing_part: bool,
 ) -> TM_Result::Type {
+    let mut cid = cid;
     let xid = GetCurrentTransactionId();
     let mut vmbuffer = InvalidBuffer as i32;
 
@@ -631,7 +631,7 @@ unsafe extern "C-unwind" fn tuple_delete(
     START_CRIT_SECTION!();
 
     PageSetPrunable(page, xid);
-    let all_visible_cleared = false;
+    let mut all_visible_cleared = false;
     if PageIsAllVisible(page) {
         all_visible_cleared = true;
         PageClearAllVisible(page);
