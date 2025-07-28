@@ -362,44 +362,33 @@ pub unsafe extern "C-unwind" fn compute_new_xmax_infomask(
     let (new_xmax, new_infomask, new_infomask2) = loop {
         let mut new_infomask = 0;
         let mut new_infomask2 = 0;
-        let mut new_xmax: TransactionId = 0.into();
 
-        if old_infomask & HEAP_XMAX_INVALID as u16 != 0 {
+        let new_xmax = if old_infomask & HEAP_XMAX_INVALID as u16 != 0 {
             if is_update {
-                new_xmax = add_to_xmax;
                 if mode == LockTupleExclusive {
                     new_infomask2 |= HEAP_KEYS_UPDATED as u16;
                 }
             } else {
                 new_infomask |= HEAP_XMAX_LOCK_ONLY as u16;
-                match mode {
-                    LockTupleKeyShare => {
-                        new_xmax = add_to_xmax;
-                        new_infomask |= HEAP_XMAX_KEYSHR_LOCK as u16;
-                    }
-                    LockTupleShare => {
-                        new_xmax = add_to_xmax;
-                        new_infomask |= HEAP_XMAX_SHR_LOCK as u16;
-                    }
-                    LockTupleNoKeyExclusive => {
-                        new_xmax = add_to_xmax;
-                        new_infomask |= HEAP_XMAX_EXCL_LOCK;
-                    }
+                new_infomask |= match mode {
+                    LockTupleKeyShare => HEAP_XMAX_KEYSHR_LOCK as u16,
+                    LockTupleShare => HEAP_XMAX_SHR_LOCK as u16,
+                    LockTupleNoKeyExclusive => HEAP_XMAX_EXCL_LOCK,
                     LockTupleExclusive => {
-                        new_xmax = add_to_xmax;
-                        new_infomask |= HEAP_XMAX_EXCL_LOCK;
                         new_infomask2 |= HEAP_KEYS_UPDATED as u16;
+                        HEAP_XMAX_EXCL_LOCK
                     }
                     _ => {
-                        new_xmax = 0.into();
                         ereport!(
                             PgLogLevel::ERROR,
-                            PgSqlErrorCode::ERRCODE_INVALID_ARGUMENT_FOR_LOG,
+                            PgSqlErrorCode::ERRCODE_LOCK_NOT_AVAILABLE,
                             "invalid lock mode"
                         );
+                        0 // to keep compiler quiet
                     }
                 }
             }
+            add_to_xmax
         } else if old_infomask & HEAP_XMAX_IS_MULTI as u16 != 0 {
             Assert(old_infomask & HEAP_XMAX_COMMITTED as u16 == 0);
 
@@ -420,8 +409,9 @@ pub unsafe extern "C-unwind" fn compute_new_xmax_infomask(
             }
 
             let new_status = get_mxact_status_for_lock(mode, is_update);
-            new_xmax = MultiXactIdExpand(xmax, add_to_xmax, new_status);
+            let new_xmax = MultiXactIdExpand(xmax, add_to_xmax, new_status);
             get_multi_xact_id_hint_bits(new_xmax, &raw mut new_infomask, &raw mut new_infomask2);
+            new_xmax
         } else if old_infomask & HEAP_XMAX_COMMITTED as u16 != 0 {
             let status = if old_infomask & HEAP_KEYS_UPDATED as u16 != 0 {
                 MultiXactStatusUpdate
@@ -430,8 +420,10 @@ pub unsafe extern "C-unwind" fn compute_new_xmax_infomask(
             };
 
             let new_status = get_mxact_status_for_lock(mode, is_update);
-            new_xmax = MultiXactIdCreate(xmax, status, add_to_xmax, new_status);
+            let new_xmax = MultiXactIdCreate(xmax, status, add_to_xmax, new_status);
             get_multi_xact_id_hint_bits(new_xmax, &raw mut new_infomask, &raw mut new_infomask2);
+
+            new_xmax
         } else if TransactionIdIsInProgress(xmax) {
             let old_status = if xmax_is_locked_only(old_infomask) {
                 if HEAP_XMAX_IS_KEYSHR_LOCKED(old_infomask) {
@@ -474,8 +466,10 @@ pub unsafe extern "C-unwind" fn compute_new_xmax_infomask(
             }
 
             let new_status = get_mxact_status_for_lock(mode, is_update);
-            new_xmax = MultiXactIdCreate(xmax, old_status, add_to_xmax, new_status);
+            let new_xmax = MultiXactIdCreate(xmax, old_status, add_to_xmax, new_status);
             get_multi_xact_id_hint_bits(new_xmax, &raw mut new_infomask, &raw mut new_infomask2);
+
+            new_xmax
         } else if !xmax_is_locked_only(old_infomask) && TransactionIdDidCommit(xmax) {
             let status = if old_infomask2 & HEAP_KEYS_UPDATED as u16 != 0 {
                 MultiXactStatusUpdate
@@ -484,12 +478,14 @@ pub unsafe extern "C-unwind" fn compute_new_xmax_infomask(
             };
 
             let new_status = get_mxact_status_for_lock(mode, is_update);
-            new_xmax = MultiXactIdCreate(xmax, status, add_to_xmax, new_status);
+            let new_xmax = MultiXactIdCreate(xmax, status, add_to_xmax, new_status);
             get_multi_xact_id_hint_bits(new_xmax, &raw mut new_infomask, &raw mut new_infomask2);
+
+            new_xmax
         } else {
             old_infomask |= HEAP_XMAX_INVALID as u16;
             continue;
-        }
+        };
 
         break (new_xmax, new_infomask, new_infomask2);
     };

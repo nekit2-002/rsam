@@ -1,73 +1,54 @@
 use crate::am_handler_port::{new_table_am_routine, TableAmArgs, TableAmHandler, TableAmRoutine};
+use crate::delete::*;
 use crate::include::general::*;
 use crate::include::relaion_macro::*;
+use crate::insert::*;
 use crate::scan::fetcher::{heap_gettup, heap_gettup_pagemode};
 use crate::scan::visibility::*;
 use crate::scan::*;
-use crate::{delete::*, START_CRIT_SECTION};
-use crate::{insert::*, END_CRIT_SECTION};
 
 // import types
 use pg_sys::{
     BlockNumber, BufferAccessStrategy, BulkInsertStateData, CommandId, ForkNumber, HeapScanDesc,
     HeapScanDescData, HeapTupleData, IndexBuildCallback, IndexFetchTableData, IndexInfo,
-    ItemPointer, LockTupleMode, LockWaitPolicy, MultiXactId, Oid, ParallelBlockTableScanDesc,
-    ParallelBlockTableScanDescData, ParallelBlockTableScanWorkerData, ParallelTableScanDesc,
-    ParallelTableScanDescData, ReadStream, ReadStreamBlockNumberCB, RelFileLocator, Relation,
-    RelationData, SampleScanState, ScanDirection, ScanKey, ScanKeyData, Snapshot, SnapshotData,
-    TM_FailureData, TM_IndexDeleteOp, TM_Result, TU_UpdateIndexes, TableScanDesc, TransactionId,
-    TupleTableSlot, TupleTableSlotOps, VacuumParams, ValidateIndexState,
+    ItemPointer, LockTupleMode, LockWaitPolicy, MultiXactId, Oid, ParallelBlockTableScanWorkerData,
+    ParallelTableScanDesc, ParallelTableScanDescData, ReadStream, ReadStreamBlockNumberCB,
+    RelFileLocator, Relation, RelationData, SampleScanState, ScanDirection, ScanKey, ScanKeyData,
+    Snapshot, SnapshotData, TM_FailureData, TM_IndexDeleteOp, TM_Result, TU_UpdateIndexes,
+    TableScanDesc, TransactionId, TupleTableSlot, TupleTableSlotOps, VacuumParams,
+    ValidateIndexState,
 };
 
 // import constants
 use pg_sys::{
-    synchronize_seqscans, InvalidBlockNumber, InvalidBuffer, NBuffers, TTSOpsBufferHeapTuple,
-    BLCKSZ, BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI,
-    READ_STREAM_SEQUENTIAL, RELPERSISTENCE_TEMP,
+    InvalidBuffer, InvalidCommandId, InvalidTransactionId, TTSOpsBufferHeapTuple, BLCKSZ,
+    BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK, HEAP_HOT_UPDATED, HEAP_KEYS_UPDATED, HEAP_MOVED,
+    HEAP_XMAX_BITS, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, READ_STREAM_SEQUENTIAL,
+    VISIBILITYMAP_VALID_BITS,
 };
-use pgrx::pg_sys::BufferAccessStrategyType::BAS_BULKREAD;
+
+use pgrx::pg_sys::ForkNumber::*;
 use pgrx::pg_sys::LockTupleMode::LockTupleExclusive;
 use pgrx::pg_sys::LockWaitPolicy::LockWaitBlock;
-use pgrx::pg_sys::{
-    visibilitymap_clear, MarkBufferDirty, TM_Result::*, HEAP_HOT_UPDATED, HEAP_KEYS_UPDATED,
-    HEAP_MOVED, HEAP_XMAX_BITS, VISIBILITYMAP_VALID_BITS,
-};
-use pgrx::pg_sys::{ForkNumber::*, InvalidCommandId};
-use pgrx::pg_sys::{InvalidTransactionId, ScanOptions::*};
-use pgrx::pg_sys::{PageClearAllVisible, SnapshotType::*};
-use pgrx::pg_sys::{ScanDirection::*, UnlockTuple};
-
+use pgrx::pg_sys::ScanOptions::*;
+use pgrx::pg_sys::TM_Result::*;
 use pgrx::pg_sys::XLTW_Oper::XLTW_Delete;
+
 // import functions
 use pgrx::pg_sys::{
     palloc, pfree, pgstat_count_heap_delete, read_stream_begin_relation, read_stream_end,
-    read_stream_reset, smgrnblocks, visibilitymap_pin, BufferGetBlockNumber, BufferGetPage,
-    BufferIsValid, ExecFetchSlotHeapTuple, ExecStoreBufferHeapTuple, FreeAccessStrategy,
-    GetAccessStrategy, GetCurrentTransactionId, HeapTupleHeaderAdjustCmax, HeapTupleHeaderGetCmax,
+    read_stream_reset, smgrnblocks, visibilitymap_clear, visibilitymap_pin, BufferGetBlockNumber,
+    BufferGetPage, BufferIsValid, ExecFetchSlotHeapTuple, ExecStoreBufferHeapTuple,
+    FreeAccessStrategy, GetCurrentTransactionId, HeapTupleHeaderAdjustCmax, HeapTupleHeaderGetCmax,
     HeapTupleHeaderIsOnlyLocked, HeapTupleSatisfiesUpdate, IsInParallelMode, ItemPointerCopy,
     ItemPointerEquals, ItemPointerGetBlockNumber, ItemPointerGetOffsetNumber,
-    ItemPointerIndicatesMovedPartitions, ItemPointerIsValid, ItemPointerSetInvalid, LockBuffer,
-    MultiXactIdSetOldestMember, PageGetItem, PageGetItemId, PageIsAllVisible, ReadBuffer,
-    RelationDecrementReferenceCount, RelationGetNumberOfBlocksInFork, RelationGetSmgr,
-    RelationIncrementReferenceCount, ReleaseBuffer, TransactionIdIsCurrentTransactionId,
-    UnlockReleaseBuffer, XactLockTableWait,
+    ItemPointerIndicatesMovedPartitions, ItemPointerIsValid, LockBuffer, MarkBufferDirty,
+    MultiXactIdSetOldestMember, PageClearAllVisible, PageGetItem, PageGetItemId, PageIsAllVisible,
+    ReadBuffer, RelationDecrementReferenceCount, RelationGetSmgr, RelationIncrementReferenceCount,
+    ReleaseBuffer, TransactionIdIsCurrentTransactionId, UnlockReleaseBuffer, UnlockTuple,
+    XactLockTableWait,
 };
 use pgrx::prelude::*;
-
-#[macro_export]
-macro_rules! IsMVCCSnapshot {
-    ($snapshot:expr) => {
-        (*$snapshot).snapshot_type == SNAPSHOT_MVCC
-            || (*$snapshot).snapshot_type == SNAPSHOT_HISTORIC_MVCC
-    };
-}
-
-#[macro_export]
-macro_rules! RelationUsesLocalBuffers {
-    ($relation:expr) => {
-        (*((*$relation).rd_rel)).relpersistence == RELPERSISTENCE_TEMP as i8
-    };
-}
 
 pgrx::extension_sql!(
     "CREATE ACCESS METHOD rsam TYPE TABLE HANDLER rsam_am_handler;",
@@ -79,86 +60,6 @@ pgrx::extension_sql!(
 unsafe extern "C-unwind" fn slot_callbacks(_rel: Relation) -> *const TupleTableSlotOps {
     // &raw const slot::TTSOpsRsAmTuple
     &raw const TTSOpsBufferHeapTuple // TODO: Implement own TupleTableSlotOps
-}
-
-#[pg_guard]
-unsafe extern "C-unwind" fn initscan(
-    scan: *mut HeapScanDescData,
-    key: *mut ScanKeyData,
-    keep_start_block: bool,
-) {
-    // Determine the number of blocks we need to scan
-    if (*scan).rs_base.rs_parallel.is_null() {
-        (*scan).rs_nblocks = RelationGetNumberOfBlocksInFork((*scan).rs_base.rs_rd, MAIN_FORKNUM);
-    } else {
-        let bpscan = (*scan).rs_base.rs_parallel as ParallelBlockTableScanDesc;
-        (*scan).rs_nblocks = (*bpscan).phs_nblocks;
-    }
-
-    let (allow_strat, allow_sync) = if !RelationUsesLocalBuffers!((*scan).rs_base.rs_rd)
-        && (*scan).rs_nblocks > (NBuffers as u32 / 4)
-    {
-        (
-            ((*scan).rs_base.rs_flags & SO_ALLOW_STRAT) != 0,
-            ((*scan).rs_base.rs_flags & SO_ALLOW_SYNC) != 0,
-        )
-    } else {
-        (false, false)
-    };
-
-    if allow_strat {
-        if (*scan).rs_strategy.is_null() {
-            (*scan).rs_strategy = GetAccessStrategy(BAS_BULKREAD);
-        }
-    } else {
-        if !(*scan).rs_strategy.is_null() {
-            FreeAccessStrategy((*scan).rs_strategy);
-        }
-        (*scan).rs_strategy = std::ptr::null_mut();
-    }
-
-    if !(*scan).rs_base.rs_parallel.is_null() {
-        if (*(*scan).rs_base.rs_parallel).phs_syncscan {
-            (*scan).rs_base.rs_flags |= SO_ALLOW_SYNC;
-        } else {
-            (*scan).rs_base.rs_flags &= !SO_ALLOW_SYNC;
-        }
-    } else if keep_start_block {
-        if allow_sync && synchronize_seqscans {
-            (*scan).rs_base.rs_flags |= SO_ALLOW_SYNC;
-        } else {
-            (*scan).rs_base.rs_flags &= !SO_ALLOW_SYNC;
-        }
-    }
-    // else if allow_sync && synchronize_seqscans {
-
-    // }
-    else {
-        (*scan).rs_base.rs_flags &= !SO_ALLOW_SYNC;
-        (*scan).rs_startblock = 0;
-    }
-
-    (*scan).rs_numblocks = InvalidBlockNumber;
-    (*scan).rs_inited = false;
-    (*scan).rs_ctup.t_data = std::ptr::null_mut();
-    ItemPointerSetInvalid(&raw mut (*scan).rs_ctup.t_self);
-    (*scan).rs_cbuf = InvalidBuffer as i32;
-    (*scan).rs_cblock = InvalidBlockNumber;
-    (*scan).rs_ntuples = 0;
-    (*scan).rs_cindex = 0;
-    (*scan).rs_dir = ForwardScanDirection;
-    (*scan).rs_prefetch_block = InvalidBlockNumber;
-
-    if !key.is_null() && (*scan).rs_base.rs_nkeys > 0 {
-        (*scan)
-            .rs_base
-            .rs_key
-            .copy_from(key, (*scan).rs_base.rs_nkeys as usize);
-    }
-
-    if ((*scan).rs_base.rs_flags & SO_TYPE_SEQSCAN) != 0 {
-        pgstat_count_heap_scan((*scan).rs_base.rs_rd);
-    }
 }
 
 #[pg_guard]
@@ -183,9 +84,6 @@ unsafe extern "C-unwind" fn scan_begin(
     (*scan).rs_cbuf = InvalidBuffer as i32;
     (*scan).rs_ctup.t_tableOid = (*rel).rd_id;
 
-    // if snapshot.is_null()
-    //     || !((*snapshot).snapshot_type == SNAPSHOT_MVCC
-    //         || (*snapshot).snapshot_type == SNAPSHOT_HISTORIC_MVCC)
     if snapshot.is_null() || !IsMVCCSnapshot!(snapshot) {
         (*scan).rs_base.rs_flags &= !SO_ALLOW_PAGEMODE;
     }
@@ -472,7 +370,7 @@ unsafe extern "C-unwind" fn tuple_delete(
     rel: Relation,
     tid: ItemPointer,
     cid: CommandId,
-    snapshot: Snapshot,
+    _snapshot: Snapshot,
     crosscheck: Snapshot,
     wait: bool,
     tmfd: *mut TM_FailureData,

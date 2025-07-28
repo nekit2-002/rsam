@@ -38,3 +38,13 @@ macro_rules! END_CRIT_SECTION {
 }
 
 pub use END_CRIT_SECTION;
+
+#[macro_export]
+macro_rules! IsMVCCSnapshot {
+    ($snapshot:expr) => {
+        (*$snapshot).snapshot_type == pgrx::pg_sys::SnapshotType::SNAPSHOT_MVCC
+            || (*$snapshot).snapshot_type == pgrx::pg_sys::SnapshotType::SNAPSHOT_HISTORIC_MVCC
+    };
+}
+
+pub use IsMVCCSnapshot;

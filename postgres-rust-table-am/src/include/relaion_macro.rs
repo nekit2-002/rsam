@@ -91,3 +91,12 @@ macro_rules! RelationIsLogicallyLogged {
 }
 
 pub use RelationIsLogicallyLogged;
+
+#[macro_export]
+macro_rules! RelationUsesLocalBuffers {
+    ($relation:expr) => {
+        (*((*$relation).rd_rel)).relpersistence == pgrx::pg_sys::RELPERSISTENCE_TEMP as i8
+    };
+}
+
+pub use RelationUsesLocalBuffers;
