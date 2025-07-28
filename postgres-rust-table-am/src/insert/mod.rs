@@ -4,19 +4,18 @@ use pgrx::pg_sys::{
     pfree, pgstat_count_heap_insert, visibilitymap_clear, visibilitymap_pin, visibilitymap_pin_ok,
     BlockNumber, BlockNumberIsValid, Buffer, BufferGetBlockNumber, BufferGetPage,
     BufferGetPageSize, BufferIsValid, BufferManagerRelation, BulkInsertState, BulkInsertStateData,
-    CommandId, ConditionalLockBuffer, CritSectionCount, ExtendBufferedRelBy,
-    GetCurrentTransactionId, GetPageWithFreeSpace, HeapTuple, HeapTupleData, HeapTupleHeader,
-    HeapTupleHeaderData, HeapTupleHeaderGetNatts, InvalidBlockNumber, InvalidBuffer,
-    InvalidOffsetNumber, Item, ItemIdData, ItemPointerGetBlockNumber, ItemPointerSet, LockBuffer,
-    MarkBufferDirty, Page, PageAddItemExtended, PageClearAllVisible, PageGetHeapFreeSpace,
-    PageGetItem, PageGetItemId, PageGetMaxOffsetNumber, PageInit, PageIsAllVisible, PageIsNew,
-    ReadBuffer, ReadBufferExtended, RecordAndGetPageWithFreeSpace, RelationData,
-    RelationGetNumberOfBlocksInFork, RelationGetSmgr, ReleaseBuffer, SizeOfPageHeaderData,
-    StdRdOptions, TransactionId, UnlockReleaseBuffer, BLCKSZ, BUFFER_LOCK_EXCLUSIVE,
-    BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK, HEAP_COMBOCID, HEAP_DEFAULT_FILLFACTOR,
-    HEAP_INSERT_FROZEN, HEAP_INSERT_SKIP_FSM, HEAP_XACT_MASK, HEAP_XMAX_COMMITTED,
-    HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, MAXALIGN, PAI_IS_HEAP, PAI_OVERWRITE,
-    RELPERSISTENCE_TEMP, VISIBILITYMAP_VALID_BITS,
+    CommandId, ConditionalLockBuffer, ExtendBufferedRelBy, GetCurrentTransactionId,
+    GetPageWithFreeSpace, HeapTuple, HeapTupleData, HeapTupleHeader, HeapTupleHeaderData,
+    HeapTupleHeaderGetNatts, InvalidBlockNumber, InvalidBuffer, InvalidOffsetNumber, Item,
+    ItemIdData, ItemPointerGetBlockNumber, ItemPointerSet, LockBuffer, MarkBufferDirty, Page,
+    PageAddItemExtended, PageClearAllVisible, PageGetHeapFreeSpace, PageGetItem, PageGetItemId,
+    PageGetMaxOffsetNumber, PageInit, PageIsAllVisible, PageIsNew, ReadBuffer, ReadBufferExtended,
+    RecordAndGetPageWithFreeSpace, RelationData, RelationGetNumberOfBlocksInFork, RelationGetSmgr,
+    ReleaseBuffer, SizeOfPageHeaderData, StdRdOptions, TransactionId, UnlockReleaseBuffer, BLCKSZ,
+    BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK, HEAP_COMBOCID,
+    HEAP_DEFAULT_FILLFACTOR, HEAP_INSERT_FROZEN, HEAP_INSERT_SKIP_FSM, HEAP_XACT_MASK,
+    HEAP_XMAX_COMMITTED, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, MAXALIGN, PAI_IS_HEAP,
+    PAI_OVERWRITE, VISIBILITYMAP_VALID_BITS,
 };
 use pgrx::pg_sys::{
     ForkNumber::*, FreeSpaceMapVacuumRange, RecordPageWithFreeSpace,
@@ -222,14 +221,18 @@ unsafe extern "C-unwind" fn RelationAddBlocks(
 #[allow(non_snake_case)]
 unsafe extern "C-unwind" fn GetVisibilityMapPins(
     rel: *mut RelationData,
-    mut buffer1: Buffer,
-    mut buffer2: Buffer,
-    mut block1: BlockNumber,
-    mut block2: BlockNumber,
+    buffer1: Buffer,
+    buffer2: Buffer,
+    block1: BlockNumber,
+    block2: BlockNumber,
     vmbuffer1: *mut Buffer,
     vmbuffer2: *mut Buffer,
 ) -> bool {
     let mut released_blocks = false;
+    let mut buffer1 = buffer1;
+    let mut buffer2 = buffer2;
+    let mut block1 = block1;
+    let mut block2 = block2;
 
     if !BufferIsValid(buffer1) || (BufferIsValid(buffer2) && block1 > block2) {
         std::mem::swap(&mut buffer1, &mut buffer2);
