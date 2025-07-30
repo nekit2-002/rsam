@@ -1,10 +1,11 @@
 mod am_handler_port;
+mod delete;
+mod include;
+mod insert;
+mod scan;
 mod slot;
 mod table_am_handler;
-mod scan;
-mod insert;
-mod include;
-mod delete;
+mod update;
 
 pgrx::pg_module_magic!();
 

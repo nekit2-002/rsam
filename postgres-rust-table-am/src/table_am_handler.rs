@@ -1,11 +1,14 @@
+use std::result;
+
 use crate::am_handler_port::{new_table_am_routine, TableAmArgs, TableAmHandler, TableAmRoutine};
-use crate::delete::*;
 use crate::include::general::*;
 use crate::include::relaion_macro::*;
 use crate::insert::*;
 use crate::scan::fetcher::{heap_gettup, heap_gettup_pagemode};
 use crate::scan::visibility::*;
 use crate::scan::*;
+use crate::update::tuple_update;
+use crate::{delete::*, update};
 
 // import types
 use pg_sys::{
@@ -32,6 +35,7 @@ use pgrx::pg_sys::LockTupleMode::LockTupleExclusive;
 use pgrx::pg_sys::LockWaitPolicy::LockWaitBlock;
 use pgrx::pg_sys::ScanOptions::*;
 use pgrx::pg_sys::TM_Result::*;
+use pgrx::pg_sys::TU_UpdateIndexes::{TU_All, TU_None, TU_Summarizing};
 use pgrx::pg_sys::XLTW_Oper::XLTW_Delete;
 
 // import functions
@@ -40,13 +44,13 @@ use pgrx::pg_sys::{
     read_stream_reset, smgrnblocks, visibilitymap_clear, visibilitymap_pin, BufferGetBlockNumber,
     BufferGetPage, BufferIsValid, ExecFetchSlotHeapTuple, ExecStoreBufferHeapTuple,
     FreeAccessStrategy, GetCurrentTransactionId, HeapTupleHeaderAdjustCmax, HeapTupleHeaderGetCmax,
-    HeapTupleHeaderIsOnlyLocked, HeapTupleSatisfiesUpdate, IsInParallelMode, ItemPointerCopy,
-    ItemPointerEquals, ItemPointerGetBlockNumber, ItemPointerGetOffsetNumber,
-    ItemPointerIndicatesMovedPartitions, ItemPointerIsValid, LockBuffer, MarkBufferDirty,
-    MultiXactIdSetOldestMember, PageClearAllVisible, PageGetItem, PageGetItemId, PageIsAllVisible,
-    ReadBuffer, RelationDecrementReferenceCount, RelationGetSmgr, RelationIncrementReferenceCount,
-    ReleaseBuffer, TransactionIdIsCurrentTransactionId, UnlockReleaseBuffer, UnlockTuple,
-    XactLockTableWait,
+    HeapTupleHeaderIsHeapOnly, HeapTupleHeaderIsOnlyLocked, HeapTupleSatisfiesUpdate,
+    IsInParallelMode, ItemPointerCopy, ItemPointerEquals, ItemPointerGetBlockNumber,
+    ItemPointerGetOffsetNumber, ItemPointerIndicatesMovedPartitions, ItemPointerIsValid,
+    LockBuffer, MarkBufferDirty, MultiXactIdSetOldestMember, PageClearAllVisible, PageGetItem,
+    PageGetItemId, PageIsAllVisible, ReadBuffer, RelationDecrementReferenceCount, RelationGetSmgr,
+    RelationIncrementReferenceCount, ReleaseBuffer, TransactionIdIsCurrentTransactionId,
+    UnlockReleaseBuffer, UnlockTuple, XactLockTableWait,
 };
 use pgrx::prelude::*;
 
@@ -581,19 +585,47 @@ unsafe extern "C-unwind" fn tuple_delete(
 }
 
 #[pg_guard]
-unsafe extern "C-unwind" fn tuple_update(
-    _rel: Relation,
-    _otid: ItemPointer,
-    _slot: *mut TupleTableSlot,
-    _cid: CommandId,
-    _snapshot: Snapshot,
-    _crosscheck: Snapshot,
-    _wait: bool,
-    _tmfd: *mut TM_FailureData,
-    _lockmode: *mut LockTupleMode::Type,
-    _update_indexes: *mut TU_UpdateIndexes::Type,
+unsafe extern "C-unwind" fn rsam_tuple_update(
+    rel: Relation,
+    otid: ItemPointer,
+    slot: *mut TupleTableSlot,
+    cid: CommandId,
+    snapshot: Snapshot,
+    crosscheck: Snapshot,
+    wait: bool,
+    tmfd: *mut TM_FailureData,
+    lockmode: *mut LockTupleMode::Type,
+    update_indexes: *mut TU_UpdateIndexes::Type,
 ) -> TM_Result::Type {
-    todo!("tuple_update")
+    let mut shouldFree = true;
+    let tuple = ExecFetchSlotHeapTuple(slot, true, &raw mut shouldFree);
+    (*slot).tts_tableOid = RelationGetRelId!(rel);
+    (*tuple).t_tableOid = (*slot).tts_tableOid;
+    let result = tuple_update(
+        rel,
+        otid,
+        tuple,
+        cid,
+        crosscheck,
+        wait,
+        tmfd,
+        lockmode,
+        update_indexes,
+    );
+
+    ItemPointerCopy(&raw const (*tuple).t_self, &raw mut (*slot).tts_tid);
+    if result != TM_Ok {
+        Assert(*update_indexes == TU_None);
+    } else if !HeapTupleHeaderIsHeapOnly((*tuple).t_data) {
+        Assert(*update_indexes == TU_All);
+    } else {
+        Assert(*update_indexes == TU_Summarizing || *update_indexes == TU_None);
+    }
+
+    if shouldFree {
+        pfree(tuple.cast());
+    }
+    result
 }
 
 #[pg_guard]
@@ -804,7 +836,7 @@ fn rsam_am_handler(_internal: TableAmArgs) -> TableAmHandler {
 
         vtable.multi_insert = Some(multi_insert);
         vtable.tuple_delete = Some(tuple_delete);
-        vtable.tuple_update = Some(tuple_update);
+        vtable.tuple_update = Some(rsam_tuple_update);
         vtable.tuple_lock = Some(tuple_lock);
 
         vtable.relation_set_new_filelocator = Some(relation_set_new_filelocator);

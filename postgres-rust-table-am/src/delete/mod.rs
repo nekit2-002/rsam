@@ -66,7 +66,7 @@ const HEAP_XMAX_EXCL_LOCK: u16 = 0x0040;
 
 #[inline]
 #[allow(non_snake_case)]
-fn HEAP_LOCKED_UPGRADED(mask: u16) -> bool {
+pub fn HEAP_LOCKED_UPGRADED(mask: u16) -> bool {
     (mask & HEAP_XMAX_IS_MULTI as u16) != 0
         && (mask & HEAP_XMAX_LOCK_ONLY as u16) != 0
         && (mask & (HEAP_XMAX_EXCL_LOCK | HEAP_XMAX_KEYSHR_LOCK as u16)) == 0
