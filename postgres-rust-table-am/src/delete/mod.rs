@@ -32,9 +32,9 @@ use crate::include::general::Assert;
 use crate::scan::visibility::xmax_is_locked_only;
 use crate::{RelationGetDescr, RelationIsLogicallyLogged};
 
-struct Info(LOCKMODE, i32, i32);
+pub struct Info(pub LOCKMODE, pub i32, pub i32);
 #[allow(non_upper_case_globals)]
-const tupleLockExtraInfo: [Info; (LockTupleExclusive + 1) as usize] = [
+pub const tupleLockExtraInfo: [Info; (LockTupleExclusive + 1) as usize] = [
     Info(
         AccessShareLock as i32,
         MultiXactStatusForKeyShare as i32,
@@ -74,19 +74,19 @@ pub fn HEAP_LOCKED_UPGRADED(mask: u16) -> bool {
 
 #[inline]
 #[allow(non_snake_case)]
-fn HEAP_XMAX_IS_KEYSHR_LOCKED(mask: u16) -> bool {
+pub fn HEAP_XMAX_IS_KEYSHR_LOCKED(mask: u16) -> bool {
     (mask & HEAP_LOCK_MASK as u16) == HEAP_XMAX_KEYSHR_LOCK as u16
 }
 
 #[inline]
 #[allow(non_snake_case)]
-fn HEAP_XMAX_IS_SHR_LOCKED(mask: u16) -> bool {
+pub fn HEAP_XMAX_IS_SHR_LOCKED(mask: u16) -> bool {
     (mask & HEAP_LOCK_MASK as u16) == HEAP_XMAX_SHR_LOCK as u16
 }
 
 #[inline]
 #[allow(non_snake_case)]
-fn HEAP_XMAX_IS_EXCL_LOCKED(mask: u16) -> bool {
+pub fn HEAP_XMAX_IS_EXCL_LOCKED(mask: u16) -> bool {
     (mask & HEAP_LOCK_MASK as u16) == HEAP_XMAX_EXCL_LOCK
 }
 

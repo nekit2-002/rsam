@@ -90,7 +90,7 @@ macro_rules! PageAddItem {
 
 #[pg_guard]
 #[allow(non_snake_case)]
-unsafe extern "C-unwind" fn heap_tuple_header_set_Xmin(
+pub unsafe extern "C-unwind" fn heap_tuple_header_set_Xmin(
     tup: *mut HeapTupleHeaderData,
     tid: TransactionId,
 ) {
@@ -99,7 +99,7 @@ unsafe extern "C-unwind" fn heap_tuple_header_set_Xmin(
 
 #[pg_guard]
 #[allow(non_snake_case)]
-unsafe extern "C-unwind" fn heap_tuple_header_set_Xmax(
+pub unsafe extern "C-unwind" fn heap_tuple_header_set_Xmax(
     tup: *mut HeapTupleHeaderData,
     tid: TransactionId,
 ) {
@@ -108,12 +108,27 @@ unsafe extern "C-unwind" fn heap_tuple_header_set_Xmax(
 
 #[pg_guard]
 #[allow(non_snake_case)]
-unsafe extern "C-unwind" fn heap_tuple_header_set_Cmin(
+pub unsafe extern "C-unwind" fn heap_tuple_header_set_Cmin(
     tup: *mut HeapTupleHeaderData,
     cid: CommandId,
 ) {
     (*tup).t_choice.t_heap.t_field3.t_cid = cid;
     (*tup).t_infomask &= !(HEAP_COMBOCID as u16);
+}
+
+#[pg_guard]
+#[allow(non_snake_case)]
+pub unsafe extern "C-unwind" fn heap_tuple_header_set_Cmax(
+    tup: *mut HeapTupleHeaderData,
+    cid: CommandId,
+    is_combo: bool,
+) {
+    (*tup).t_choice.t_heap.t_field3.t_cid = cid;
+    if is_combo {
+        (*tup).t_infomask |= HEAP_COMBOCID as u16;
+    } else {
+        (*tup).t_infomask &= !(HEAP_COMBOCID as u16);
+    }
 }
 
 #[pg_guard]

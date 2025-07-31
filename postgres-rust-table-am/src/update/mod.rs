@@ -1,36 +1,41 @@
-use std::result;
+use pgrx::pg_sys::{
+    bms_add_members, bms_free, bms_overlap, heap_getattr, oper, pfree, pgstat_count_heap_update,
+    visibilitymap_clear, visibilitymap_pin, BufferGetBlockNumber, BufferGetPage, BufferIsValid,
+    ConditionalXactLockTableWait, DoLockModesConflict, GetCurrentTransactionId,
+    HeapTupleGetUpdateXid, HeapTupleHeaderAdjustCmax, HeapTupleHeaderGetCmax,
+    HeapTupleHeaderGetNatts, HeapTupleSatisfiesUpdate, IsInParallelMode, ItemPointerEquals,
+    ItemPointerGetBlockNumber, ItemPointerGetOffsetNumber, ItemPointerIsValid, LockBuffer,
+    MarkBufferDirty, MultiXactIdSetOldestMember, PageClearAllVisible, PageGetHeapFreeSpace,
+    PageGetItem, PageGetItemId, PageIsAllVisible, PageSetFull, ReadBuffer,
+    RelationGetIndexAttrBitmap, RelationSupportsSysCache, ReleaseBuffer, TransactionIdDidAbort,
+    TransactionIdIsCurrentTransactionId, TransactionIdIsInProgress, UnlockReleaseBuffer,
+    UnlockTuple, XactLockTableWait, MAXALIGN,
+};
+use pgrx::pg_sys::{
+    Bitmapset, CommandId, HeapTuple, HeapTupleData, IndexAttrBitmapKind::*, ItemPointer,
+    LockTupleMode, LockTupleMode::*, MultiXactId, MultiXactStatus, MultiXactStatus::*, Relation,
+    Snapshot, TM_FailureData, TM_Result, TM_Result::*, TU_UpdateIndexes, TU_UpdateIndexes::*,
+    TransactionId, XLTW_Oper, XLTW_Oper::*,
+};
+use pgrx::pg_sys::{
+    InvalidBuffer, InvalidCommandId, InvalidTransactionId, BUFFER_LOCK_EXCLUSIVE,
+    BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK, HEAP_HOT_UPDATED, HEAP_KEYS_UPDATED, HEAP_MOVED,
+    HEAP_ONLY_TUPLE, HEAP_UPDATED, HEAP_XACT_MASK, HEAP_XMAX_BITS, HEAP_XMAX_INVALID,
+    HEAP_XMAX_IS_MULTI, HEAP_XMAX_KEYSHR_LOCK, HEAP_XMAX_LOCK_ONLY, VISIBILITYMAP_VALID_BITS,
+};
 
-use pgrx::pg_sys::Bitmapset;
-use pgrx::pg_sys::HeapTupleData;
-use pgrx::pg_sys::IndexAttrBitmapKind::*;
-use pgrx::pg_sys::LockTupleMode::*;
-use pgrx::pg_sys::MultiXactStatus::*;
-use pgrx::pg_sys::TM_Result::*;
-use pgrx::pg_sys::TU_UpdateIndexes::*;
-use pgrx::pg_sys::TransactionId;
-use pgrx::pg_sys::BUFFER_LOCK_UNLOCK;
-use pgrx::pg_sys::HEAP_XMAX_INVALID;
-use pgrx::pg_sys::HEAP_XMAX_IS_MULTI;
-use pgrx::pg_sys::{
-    bms_add_members, bms_free, bms_overlap, heap_getattr, visibilitymap_pin, BufferGetPage,
-    GetCurrentTransactionId, HeapTupleHeaderGetNatts, HeapTupleSatisfiesUpdate, IsInParallelMode,
-    ItemPointerEquals, ItemPointerGetBlockNumber, ItemPointerGetOffsetNumber, ItemPointerIsValid,
-    LockBuffer, MultiXactIdSetOldestMember, PageGetItem, PageGetItemId, PageIsAllVisible,
-    ReadBuffer, RelationGetIndexAttrBitmap, RelationSupportsSysCache, ReleaseBuffer,
-    UnlockReleaseBuffer,
-};
-use pgrx::pg_sys::{
-    CommandId, HeapTuple, InvalidBuffer, InvalidCommandId, InvalidTransactionId, ItemPointer,
-    LockTupleMode, Relation, Snapshot, TM_FailureData, TM_Result, TU_UpdateIndexes,
-    BUFFER_LOCK_EXCLUSIVE, HEAP_XMAX_KEYSHR_LOCK, HEAP_XMAX_LOCK_ONLY,
-};
+use pgrx::pg_sys::LockWaitPolicy::LockWaitBlock;
+use pgrx::pg_sys::VISIBILITYMAP_ALL_FROZEN;
 
 use pgrx::prelude::*;
 
-use crate::delete::compute_new_xmax_infomask;
-use crate::delete::get_multi_xact_id_hint_bits;
-use crate::delete::HEAP_LOCKED_UPGRADED;
+use crate::delete::*;
 use crate::include::general::*;
+use crate::insert::{
+    heap_tuple_header_set_Cmax, heap_tuple_header_set_Cmin, heap_tuple_header_set_Xmax,
+    heap_tuple_header_set_Xmin, relation_put_tuple, RelationGetBufferForTuple,
+};
+use crate::scan::visibility::{tuple_satisfies_visibility, xmax_is_locked_only};
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn determine_columns_info(
@@ -44,6 +49,47 @@ pub unsafe extern "C-unwind" fn determine_columns_info(
     todo!("")
 }
 
+pub unsafe extern "C-unwind" fn tuple_clear_hot_updated(tup: *mut HeapTupleData) {
+    (*(*tup).t_data).t_infomask2 &= !HEAP_HOT_UPDATED as u16;
+}
+
+pub unsafe extern "C-unwind" fn tuple_clear_heap_only(tup: *mut HeapTupleData) {
+    (*(*tup).t_data).t_infomask2 &= !HEAP_ONLY_TUPLE as u16;
+}
+
+pub unsafe extern "C-unwind" fn tuple_set_hot_updated(tup: *mut HeapTupleData) {
+    (*(*tup).t_data).t_infomask2 |= HEAP_HOT_UPDATED as u16;
+}
+
+pub unsafe extern "C-unwind" fn tuple_set_heap_only(tup: *mut HeapTupleData) {
+    (*(*tup).t_data).t_infomask2 |= HEAP_ONLY_TUPLE as u16;
+}
+
+#[pg_guard]
+#[allow(non_snake_case)]
+pub unsafe extern "C-unwind" fn DoesMultiXactIdConflict(
+    multi: MultiXactId,
+    infomask: u16,
+    lock_mode: LockTupleMode::Type,
+    current_is_member: *mut bool,
+) -> bool {
+    todo!("")
+}
+
+#[pg_guard]
+#[allow(non_snake_case)]
+pub unsafe extern "C-unwind" fn MultiXactIdWait(
+    multi: MultiXactId,
+    status: MultiXactStatus::Type,
+    infomask: u16,
+    nowait: bool,
+    rel: Relation,
+    ctid: ItemPointer,
+    oper: XLTW_Oper::Type,
+    remaining: *mut i32,
+) {
+}
+
 #[pg_guard]
 pub unsafe extern "C-unwind" fn tuple_update(
     rel: Relation,
@@ -53,9 +99,10 @@ pub unsafe extern "C-unwind" fn tuple_update(
     crosscheck: Snapshot,
     wait: bool,
     tmfd: *mut TM_FailureData,
-    lockMode: *mut LockTupleMode::Type,
+    lock_mode: *mut LockTupleMode::Type,
     update_indexes: *mut TU_UpdateIndexes::Type,
 ) -> TM_Result::Type {
+    let mut cid = cid;
     let xid = GetCurrentTransactionId();
     let mut old_key_tuple: HeapTuple = std::ptr::null_mut();
     let mut old_key_copied = false;
@@ -64,8 +111,8 @@ pub unsafe extern "C-unwind" fn tuple_update(
     let mut have_tuple_lock = false;
     let mut use_hot_update = false;
     let mut summarized_update = false;
-    let mut all_visible_cleared = false;
-    let mut all_visible_cleared_new = false;
+    // let mut all_visible_cleared = false;
+    // let mut all_visible_cleared_new = false;
     let mut id_has_external = false;
 
     Assert(ItemPointerIsValid(otid));
@@ -137,22 +184,20 @@ pub unsafe extern "C-unwind" fn tuple_update(
     );
 
     let (mxact_status, key_intact) = if !bms_overlap(modified_attrs, key_attrs) {
-        *lockMode = LockTupleNoKeyExclusive;
+        *lock_mode = LockTupleNoKeyExclusive;
         MultiXactIdSetOldestMember();
         (MultiXactStatusNoKeyUpdate, true)
     } else {
-        *lockMode = LockTupleExclusive;
+        *lock_mode = LockTupleExclusive;
         (MultiXactStatusUpdate, false)
     };
 
-    let mut infomask_new_tuple = 0u16;
-    let mut infomask2_new_tuple = 0u16;
-
-    let (mut checked_lockers, mut locker_remains) = loop {
+    let (checked_lockers, locker_remains) = loop {
         let mut checked_lockers = false;
         let mut locker_remains = false;
         let mut result = HeapTupleSatisfiesUpdate(&raw mut old_tup, cid, buffer);
         Assert(result != TM_BeingModified || wait);
+
         if result == TM_Invisible {
             UnlockReleaseBuffer(buffer);
             ereport!(
@@ -161,6 +206,99 @@ pub unsafe extern "C-unwind" fn tuple_update(
                 "attempted to update invisible tuple"
             );
         } else if result == TM_BeingModified && wait {
+            let mut can_continue = false;
+            let xwait = (*old_tup.t_data).t_choice.t_heap.t_xmax;
+            let mask = (*old_tup.t_data).t_infomask;
+            if mask & HEAP_XMAX_IS_MULTI as u16 != 0 {
+                let mut current_is_member = false;
+                let mut update_xact: TransactionId = 0.into();
+                if DoesMultiXactIdConflict(xwait, mask, *lock_mode, &raw mut current_is_member) {
+                    LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+
+                    if !current_is_member {
+                        aquire_tuplock(
+                            rel,
+                            &raw mut (old_tup.t_self),
+                            *lock_mode,
+                            LockWaitBlock,
+                            &raw mut have_tuple_lock,
+                        );
+                    }
+
+                    let mut remain: i32 = 0;
+                    MultiXactIdWait(
+                        xwait,
+                        mxact_status,
+                        mask,
+                        false,
+                        rel,
+                        &raw mut (old_tup.t_self),
+                        XLTW_Update,
+                        &raw mut remain,
+                    );
+
+                    checked_lockers = true;
+                    locker_remains = remain != 0;
+                    LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
+                    if xmax_infomask_changed((*old_tup.t_data).t_infomask, mask)
+                        || (*old_tup.t_data).t_choice.t_heap.t_xmax != xwait
+                    {
+                        continue;
+                    }
+
+                    update_xact = if !xmax_is_locked_only((*old_tup.t_data).t_infomask) {
+                        HeapTupleGetUpdateXid(old_tup.t_data)
+                    } else {
+                        InvalidTransactionId
+                    };
+
+                    if update_xact == 0.into() || TransactionIdDidAbort(update_xact) {
+                        can_continue = true;
+                    }
+                }
+            } else if TransactionIdIsCurrentTransactionId(xwait) {
+                checked_lockers = true;
+                locker_remains = true;
+                can_continue = true;
+            } else if HEAP_XMAX_IS_KEYSHR_LOCKED(mask) && key_intact {
+                checked_lockers = true;
+                locker_remains = true;
+                can_continue = true;
+            } else {
+                LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+                aquire_tuplock(
+                    rel,
+                    &raw mut (old_tup.t_self),
+                    *lock_mode,
+                    LockWaitBlock,
+                    &raw mut have_tuple_lock,
+                );
+
+                XactLockTableWait(xwait, rel, &raw mut (old_tup.t_self), XLTW_Update);
+                checked_lockers = true;
+                LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
+                if xmax_infomask_changed((*old_tup.t_data).t_infomask, mask)
+                    || xwait != (*old_tup.t_data).t_choice.t_heap.t_xmax
+                {
+                    continue;
+                }
+
+                UpdateXmaxHintBits(old_tup.t_data, buffer, xwait);
+                if (*old_tup.t_data).t_infomask & HEAP_XMAX_INVALID as u16 != 0 {
+                    can_continue = true;
+                }
+            }
+
+            result = if can_continue {
+                TM_Ok
+            } else if !ItemPointerEquals(
+                &raw mut (old_tup.t_self),
+                &raw mut (*old_tup.t_data).t_ctid,
+            ) {
+                TM_Updated
+            } else {
+                TM_Deleted
+            };
         }
 
         if result != TM_Ok {
@@ -180,9 +318,43 @@ pub unsafe extern "C-unwind" fn tuple_update(
             );
         }
 
-        if !crosscheck.is_null() && result == TM_Ok {}
+        if !crosscheck.is_null() && result == TM_Ok {
+            if !tuple_satisfies_visibility(&raw mut old_tup, crosscheck, buffer) {
+                result = TM_Updated
+            }
+        }
 
-        if result != TM_Ok {}
+        if result != TM_Ok {
+            (*tmfd).ctid = (*old_tup.t_data).t_ctid;
+            (*tmfd).xmax = tuple_header_get_update_xid(old_tup.t_data);
+            (*tmfd).cmax = if result == TM_SelfModified {
+                HeapTupleHeaderGetCmax(old_tup.t_data)
+            } else {
+                InvalidCommandId
+            };
+
+            UnlockReleaseBuffer(buffer);
+            if have_tuple_lock {
+                UnlockTuple(
+                    rel,
+                    &raw mut (old_tup.t_self),
+                    tupleLockExtraInfo[*lock_mode as usize].0,
+                );
+            }
+
+            if vmbuffer != InvalidBuffer as i32 {
+                ReleaseBuffer(vmbuffer);
+            }
+
+            *update_indexes = TU_None;
+            bms_free(hot_attrs);
+            bms_free(sum_attrs);
+            bms_free(key_attrs);
+            bms_free(id_attrs);
+            bms_free(modified_attrs);
+            bms_free(interesting_attrs);
+            return result;
+        }
 
         if vmbuffer == InvalidBuffer as i32 && PageIsAllVisible(page) {
             LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
@@ -203,7 +375,7 @@ pub unsafe extern "C-unwind" fn tuple_update(
         (*old_tup.t_data).t_infomask,
         (*old_tup.t_data).t_infomask2,
         xid,
-        *lockMode,
+        *lock_mode,
         true,
         &raw mut xmax_old_tuple,
         &raw mut infomask_old_tuple,
@@ -219,6 +391,8 @@ pub unsafe extern "C-unwind" fn tuple_update(
         (*old_tup.t_data).t_choice.t_heap.t_xmax
     };
 
+    let mut infomask_new_tuple = 0u16;
+    let mut infomask2_new_tuple = 0u16;
     if xmax_new_tuple == 0.into() {
         infomask_new_tuple = HEAP_XMAX_INVALID as u16;
         infomask2_new_tuple = 0;
@@ -234,6 +408,221 @@ pub unsafe extern "C-unwind" fn tuple_update(
             infomask2_new_tuple = 0;
         }
     }
+
+    (*(*new_tup).t_data).t_infomask &= !HEAP_XACT_MASK as u16;
+    (*(*new_tup).t_data).t_infomask2 &= !HEAP2_XACT_MASK as u16;
+    heap_tuple_header_set_Xmin((*new_tup).t_data, xid);
+    heap_tuple_header_set_Cmin((*new_tup).t_data, cid);
+    (*(*new_tup).t_data).t_infomask |= HEAP_UPDATED as u16 | infomask_new_tuple;
+    (*(*new_tup).t_data).t_infomask2 |= infomask2_new_tuple;
+    heap_tuple_header_set_Xmax((*new_tup).t_data, xmax_new_tuple);
+
+    let mut is_combo = false;
+    HeapTupleHeaderAdjustCmax(old_tup.t_data, &raw mut cid, &raw mut is_combo);
+    // without toaster stuff at the moment
+    let needs_toast = false;
+    let mut pageFree = PageGetHeapFreeSpace(page);
+    let newtupsize = MAXALIGN((*new_tup).t_len as usize);
+    let (new_buf, heaptup) = if needs_toast || newtupsize > pageFree {
+        let mut xmax_lock_old_tuple: TransactionId = 0.into();
+        let mut infomask_lock_old_tuple = 0u16;
+        let mut infomask2_lock_old_tuple = 0u16;
+        // let mut cleared_all_frozen = false;
+
+        compute_new_xmax_infomask(
+            (*old_tup.t_data).t_choice.t_heap.t_xmax,
+            (*old_tup.t_data).t_infomask,
+            (*old_tup.t_data).t_infomask2,
+            xid,
+            *lock_mode,
+            false,
+            &raw mut xmax_lock_old_tuple,
+            &raw mut infomask_lock_old_tuple,
+            &raw mut infomask2_lock_old_tuple,
+        );
+
+        Assert(xmax_is_locked_only(infomask_lock_old_tuple));
+        START_CRIT_SECTION!();
+        (*old_tup.t_data).t_infomask &= !(HEAP_XMAX_BITS | HEAP_MOVED) as u16;
+        (*old_tup.t_data).t_infomask2 &= !HEAP_KEYS_UPDATED as u16;
+        tuple_clear_hot_updated(&raw mut old_tup);
+        Assert(xmax_lock_old_tuple != 0.into());
+        heap_tuple_header_set_Xmax(old_tup.t_data, xmax_lock_old_tuple);
+        (*old_tup.t_data).t_infomask |= infomask_lock_old_tuple;
+        (*old_tup.t_data).t_infomask2 |= infomask2_lock_old_tuple;
+        heap_tuple_header_set_Cmax(old_tup.t_data, cid, is_combo);
+        (*old_tup.t_data).t_ctid = old_tup.t_self;
+
+        if PageIsAllVisible(page)
+            && visibilitymap_clear(rel, block, vmbuffer, VISIBILITYMAP_ALL_FROZEN as u8)
+        {
+            // cleared_all_frozen = true;
+        }
+
+        MarkBufferDirty(buffer);
+        // wal stuff
+        // if RelationNeedsWal!(rel) {}
+
+        END_CRIT_SECTION!();
+
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+        // here must be needs_toast condition
+        let heaptup = new_tup;
+        // let mut newbuf = InvalidBuffer as i32;
+        let newbuf = loop {
+            if newtupsize > pageFree {
+                break RelationGetBufferForTuple(
+                    rel,
+                    (*heaptup).t_len as usize,
+                    buffer,
+                    0,
+                    std::ptr::null_mut(),
+                    &raw mut vmbuffer_new,
+                    &raw mut vmbuffer,
+                    0,
+                );
+            }
+
+            if vmbuffer == InvalidBuffer as i32 && PageIsAllVisible(page) {
+                visibilitymap_pin(rel, block, &raw mut vmbuffer);
+            }
+
+            LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE as i32);
+            pageFree = PageGetHeapFreeSpace(page);
+            if newtupsize > pageFree || (vmbuffer == InvalidBuffer as i32 && PageIsAllVisible(page))
+            {
+                LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+            } else {
+                break buffer;
+            }
+        };
+        (newbuf, heaptup)
+    } else {
+        (buffer, new_tup)
+    };
+
+    if new_buf == buffer {
+        if !bms_overlap(modified_attrs, hot_attrs) {
+            use_hot_update = true;
+            if bms_overlap(modified_attrs, sum_attrs) {
+                summarized_update = true;
+            }
+        }
+    } else {
+        PageSetFull(page);
+    }
+
+    old_key_tuple = extract_replica_identity(
+        rel,
+        &raw mut old_tup,
+        bms_overlap(modified_attrs, id_attrs) || id_has_external,
+        &raw mut old_key_copied,
+    );
+
+    START_CRIT_SECTION!();
+    PageSetPrunable(page, xid);
+    if use_hot_update {
+        tuple_set_hot_updated(&raw mut old_tup);
+        tuple_set_heap_only(heaptup);
+        tuple_set_heap_only(new_tup);
+    } else {
+        tuple_clear_hot_updated(&raw mut old_tup);
+        tuple_clear_heap_only(heaptup);
+        tuple_clear_heap_only(new_tup);
+    }
+    relation_put_tuple(rel, new_buf, heaptup);
+
+    (*old_tup.t_data).t_infomask &= !(HEAP_XMAX_BITS | HEAP_MOVED) as u16;
+    (*old_tup.t_data).t_infomask2 &= !HEAP_KEYS_UPDATED as u16;
+    Assert(xmax_old_tuple != 0.into());
+    heap_tuple_header_set_Xmax(old_tup.t_data, xmax_old_tuple);
+    (*old_tup.t_data).t_infomask |= infomask_old_tuple;
+    (*old_tup.t_data).t_infomask2 |= infomask2_old_tuple;
+    heap_tuple_header_set_Cmax(old_tup.t_data, cid, is_combo);
+    (*old_tup.t_data).t_ctid = (*heaptup).t_self;
+
+    if PageIsAllVisible(BufferGetPage(buffer)) {
+        // all_visible_cleared = true;
+        PageClearAllVisible(BufferGetPage(buffer));
+        visibilitymap_clear(
+            rel,
+            BufferGetBlockNumber(buffer),
+            vmbuffer,
+            VISIBILITYMAP_VALID_BITS as u8,
+        );
+    }
+
+    if new_buf != buffer && PageIsAllVisible(BufferGetPage(new_buf)) {
+        // all_visible_cleared_new = true;
+        PageClearAllVisible(BufferGetPage(new_buf));
+        visibilitymap_clear(
+            rel,
+            BufferGetBlockNumber(new_buf),
+            vmbuffer_new,
+            VISIBILITYMAP_VALID_BITS as u8,
+        );
+    }
+
+    if new_buf != buffer {
+        MarkBufferDirty(new_buf);
+    }
+
+    MarkBufferDirty(buffer);
+    // wal stuff here
+
+    END_CRIT_SECTION!();
+    if new_buf != buffer {
+        LockBuffer(new_buf, BUFFER_LOCK_UNLOCK as i32);
+    }
+    LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+
+    if new_buf != buffer {
+        ReleaseBuffer(new_buf);
+    }
+    ReleaseBuffer(buffer);
+
+    if BufferIsValid(vmbuffer_new) {
+        ReleaseBuffer(vmbuffer_new);
+    }
+
+    if BufferIsValid(vmbuffer) {
+        ReleaseBuffer(vmbuffer);
+    }
+
+    if have_tuple_lock {
+        UnlockTuple(
+            rel,
+            &raw mut (old_tup.t_self),
+            tupleLockExtraInfo[*lock_mode as usize].0,
+        );
+    }
+
+    pgstat_count_heap_update(rel, use_hot_update, new_buf != buffer);
+    if heaptup != new_tup {
+        (*new_tup).t_self = (*heaptup).t_self;
+        pfree(heaptup.cast());
+    }
+
+    *update_indexes = if use_hot_update {
+        if summarized_update {
+            TU_Summarizing
+        } else {
+            TU_None
+        }
+    } else {
+        TU_All
+    };
+
+    if !old_key_tuple.is_null() && old_key_copied {
+        pfree(old_key_tuple.cast());
+    }
+
+    bms_free(hot_attrs);
+    bms_free(sum_attrs);
+    bms_free(key_attrs);
+    bms_free(id_attrs);
+    bms_free(modified_attrs);
+    bms_free(interesting_attrs);
 
     TM_Ok
 }
