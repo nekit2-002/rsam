@@ -1,21 +1,23 @@
 use pgrx::pg_sys::{
-    bms_add_members, bms_free, bms_overlap, heap_getattr, oper, pfree, pgstat_count_heap_update,
-    visibilitymap_clear, visibilitymap_pin, BufferGetBlockNumber, BufferGetPage, BufferIsValid,
-    ConditionalXactLockTableWait, DoLockModesConflict, GetCurrentTransactionId,
-    HeapTupleGetUpdateXid, HeapTupleHeaderAdjustCmax, HeapTupleHeaderGetCmax,
-    HeapTupleHeaderGetNatts, HeapTupleSatisfiesUpdate, IsInParallelMode, ItemPointerEquals,
-    ItemPointerGetBlockNumber, ItemPointerGetOffsetNumber, ItemPointerIsValid, LockBuffer,
-    MarkBufferDirty, MultiXactIdSetOldestMember, PageClearAllVisible, PageGetHeapFreeSpace,
-    PageGetItem, PageGetItemId, PageIsAllVisible, PageSetFull, ReadBuffer,
-    RelationGetIndexAttrBitmap, RelationSupportsSysCache, ReleaseBuffer, TransactionIdDidAbort,
-    TransactionIdIsCurrentTransactionId, TransactionIdIsInProgress, UnlockReleaseBuffer,
+    bms_add_member, bms_add_members, bms_free, bms_next_member, bms_overlap, heap_getattr, oper,
+    pfree, pgstat_count_heap_update, varattrib_1b, varlena, visibilitymap_clear, visibilitymap_pin,
+    BufferGetBlockNumber, BufferGetPage, BufferIsValid, ConditionalXactLockTableWait, Datum,
+    DatumGetObjectId, DatumGetPointer, DoLockModesConflict, FirstLowInvalidHeapAttributeNumber,
+    FormData_pg_attribute, GetCurrentTransactionId, GetMultiXactIdMembers, HeapTupleGetUpdateXid,
+    HeapTupleHeaderAdjustCmax, HeapTupleHeaderGetCmax, HeapTupleHeaderGetNatts,
+    HeapTupleSatisfiesUpdate, IsInParallelMode, ItemPointerEquals, ItemPointerGetBlockNumber,
+    ItemPointerGetOffsetNumber, ItemPointerIsValid, LockBuffer, MarkBufferDirty,
+    MultiXactIdSetOldestMember, PageClearAllVisible, PageGetHeapFreeSpace, PageGetItem,
+    PageGetItemId, PageIsAllVisible, PageSetFull, ReadBuffer, RelationGetIndexAttrBitmap,
+    RelationSupportsSysCache, ReleaseBuffer, Size, TableOidAttributeNumber, TransactionIdDidAbort,
+    TransactionIdIsCurrentTransactionId, TransactionIdIsInProgress, TupleDesc, UnlockReleaseBuffer,
     UnlockTuple, XactLockTableWait, MAXALIGN,
 };
 use pgrx::pg_sys::{
     Bitmapset, CommandId, HeapTuple, HeapTupleData, IndexAttrBitmapKind::*, ItemPointer,
     LockTupleMode, LockTupleMode::*, MultiXactId, MultiXactStatus, MultiXactStatus::*, Relation,
     Snapshot, TM_FailureData, TM_Result, TM_Result::*, TU_UpdateIndexes, TU_UpdateIndexes::*,
-    TransactionId, XLTW_Oper, XLTW_Oper::*,
+    TransactionId, XLTW_Oper, XLTW_Oper::*, LOCKMODE,
 };
 use pgrx::pg_sys::{
     InvalidBuffer, InvalidCommandId, InvalidTransactionId, BUFFER_LOCK_EXCLUSIVE,
@@ -26,27 +28,165 @@ use pgrx::pg_sys::{
 
 use pgrx::pg_sys::LockWaitPolicy::LockWaitBlock;
 use pgrx::pg_sys::VISIBILITYMAP_ALL_FROZEN;
-
 use pgrx::prelude::*;
+use std::slice::from_raw_parts_mut;
 
-use crate::delete::*;
 use crate::include::general::*;
 use crate::insert::{
     heap_tuple_header_set_Cmax, heap_tuple_header_set_Cmin, heap_tuple_header_set_Xmax,
     heap_tuple_header_set_Xmin, relation_put_tuple, RelationGetBufferForTuple,
 };
 use crate::scan::visibility::{tuple_satisfies_visibility, xmax_is_locked_only};
+use crate::{delete::*, RelationGetDescr};
+
+// #[pg_guard]
+// #[allow(non_snake_case)]
+// pub unsafe extern "C-unwind" fn datumGetSize(val: Datum, typ_by_val: bool, typLen: i32) -> usize {
+//     if typ_by_val {
+//         Assert(typLen > 0 && typLen as usize <= std::mem::size_of::<Datum>());
+//         typLen as usize
+//     } else {
+//         if typLen > 0 {
+//             typLen as usize
+//         } else if typLen == -1 {
+//             let s: *const varlena = DatumGetPointer(val).cast();
+//             if s.is_null() {
+//                 ereport!(
+//                     PgLogLevel::ERROR,
+//                     PgSqlErrorCode::ERRCODE_DATA_EXCEPTION,
+//                     "invalid Datum pointer"
+//                 );
+//             }
+
+//             0 // TODO: fix this
+//         } else if typLen == -2 {
+//             let s = DatumGetPointer(val);
+//             if s.is_null() {
+//                 ereport!(
+//                     PgLogLevel::ERROR,
+//                     PgSqlErrorCode::ERRCODE_DATA_EXCEPTION,
+//                     "invalid Datum pointer"
+//                 );
+//             }
+//             libc::strlen(s) + 1
+//         } else {
+//             ereport!(
+//                 PgLogLevel::ERROR,
+//                 PgSqlErrorCode::ERRCODE_DATATYPE_MISMATCH,
+//                 "invalid type len"
+//             );
+//             0
+//         }
+//     }
+// }
+
+// #[pg_guard]
+// #[allow(non_snake_case)]
+// pub unsafe extern "C-unwind" fn datumIsEqual(
+//     val1: Datum,
+//     val2: Datum,
+//     typ_by_val: bool,
+//     typLen: i32,
+// ) -> bool {
+//     if typ_by_val {
+//         val1 == val2
+//     } else {
+//         let size1 = datumGetSize(val1, typ_by_val, typLen);
+//         let size2 = datumGetSize(val1, typ_by_val, typLen);
+//         if size1 != size2 {
+//             false
+//         } else {
+//             let s1 = from_raw_parts_mut(DatumGetPointer(val1), size1);
+//             let s2 = from_raw_parts_mut(DatumGetPointer(val2), size1);
+//             s1 == s2
+//         }
+//     }
+// }
+
+// #[pg_guard]
+// pub unsafe extern "C-unwind" fn attr_equals(
+//     tupdesc: TupleDesc,
+//     att_num: i32,
+//     val1: Datum,
+//     val2: Datum,
+//     isnull1: bool,
+//     isnull2: bool,
+// ) -> bool {
+//     if isnull1 != isnull2 {
+//         return false;
+//     }
+
+//     if isnull1 {
+//         return true;
+//     }
+
+//     if att_num <= 0 {
+//         DatumGetObjectId(val1) == DatumGetObjectId(val2)
+//     } else {
+//         let att = tuple_desc_attr(tupdesc, att_num - 1);
+//         datumIsEqual(val1, val2, (*att).attbyval, (*att).attlen as i32)
+//     }
+// }
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn tuple_desc_attr(
+    tupdesc: TupleDesc,
+    i: i32,
+) -> *mut FormData_pg_attribute {
+    (*tupdesc).attrs.as_mut_ptr().offset(i as isize)
+}
 
 #[pg_guard]
 pub unsafe extern "C-unwind" fn determine_columns_info(
     rel: Relation,
     interesting_cols: *mut Bitmapset,
-    external_cols: *mut Bitmapset,
+    _external_cols: *mut Bitmapset, // without external for now
     old_tup: HeapTuple,
     new_tup: HeapTuple,
-    has_external: *mut bool,
+    _has_external: *mut bool, // without external for now
 ) -> *mut Bitmapset {
-    todo!("")
+    let mut modified = std::ptr::null_mut();
+    let tupdesc = RelationGetDescr!(rel);
+    let mut att_id = -1;
+    att_id = bms_next_member(interesting_cols, att_id);
+    while att_id >= 0 {
+        let att_num = att_id + FirstLowInvalidHeapAttributeNumber;
+        if att_num == 0 {
+            modified = bms_add_member(modified, att_id);
+            att_id = bms_next_member(interesting_cols, att_id);
+            continue;
+        }
+
+        if att_num < 0 {
+            if att_num != TableOidAttributeNumber {
+                modified = bms_add_member(modified, att_id);
+                att_id = bms_next_member(interesting_cols, att_id);
+                continue;
+            }
+        }
+
+        let mut isnull1 = false;
+        let _val1 = heap_getattr(old_tup, att_num, tupdesc, &mut isnull1);
+        let mut isnull2 = false;
+        let _val2 = heap_getattr(new_tup, att_num, tupdesc, &mut isnull2);
+        // if !attr_equals(tupdesc, att_num, val1, val2, isnull1, isnull2) {
+        //     modified = bms_add_member(modified, att_id);
+        //     att_id = bms_next_member(interesting_cols, att_id);
+        //     continue;
+        // }
+
+        if att_num < 0 || isnull1 || (*tuple_desc_attr(tupdesc, att_num - 1)).attlen != -1 {
+            att_id = bms_next_member(interesting_cols, att_id);
+            continue;
+        }
+
+        // if (VARATT_IS_EXTERNAL((struct varlena *) DatumGetPointer(value1)) &&
+        //     bms_is_member(attidx, external_cols))
+
+        att_id = bms_next_member(interesting_cols, att_id);
+    }
+
+    modified
 }
 
 pub unsafe extern "C-unwind" fn tuple_clear_hot_updated(tup: *mut HeapTupleData) {
@@ -73,7 +213,57 @@ pub unsafe extern "C-unwind" fn DoesMultiXactIdConflict(
     lock_mode: LockTupleMode::Type,
     current_is_member: *mut bool,
 ) -> bool {
-    todo!("")
+    let mut result = false;
+    let mut members = std::ptr::null_mut();
+    let wanted = tupleLockExtraInfo[lock_mode as usize].0;
+    if HEAP_LOCKED_UPGRADED(infomask) {
+        return false;
+    }
+    let nmembers = GetMultiXactIdMembers(
+        multi,
+        &raw mut members,
+        false,
+        xmax_is_locked_only(infomask),
+    );
+
+    if nmembers >= 0 {
+        let members_slice = from_raw_parts_mut(members, nmembers as usize);
+        for m in members_slice {
+            if result && (current_is_member.is_null() || *current_is_member) {
+                break;
+            }
+
+            let mem_lock_mode: LOCKMODE = LOCKMODE_from_mxstatus!(m.status);
+            let mem_xid = m.xid;
+            if TransactionIdIsCurrentTransactionId(mem_xid) {
+                if !current_is_member.is_null() {
+                    *current_is_member = true;
+                    continue;
+                } else if result {
+                    continue;
+                }
+
+                if !DoLockModesConflict(mem_lock_mode, wanted) {
+                    continue;
+                }
+
+                if m.status > MultiXactStatusForUpdate {
+                    if TransactionIdDidAbort(mem_xid) {
+                        continue;
+                    }
+                } else {
+                    if !TransactionIdIsInProgress(mem_xid) {
+                        continue;
+                    }
+                }
+
+                result = true;
+            }
+        }
+        pfree(members.cast());
+    }
+
+    result
 }
 
 #[pg_guard]
@@ -87,7 +277,58 @@ pub unsafe extern "C-unwind" fn MultiXactIdWait(
     ctid: ItemPointer,
     oper: XLTW_Oper::Type,
     remaining: *mut i32,
-) {
+) -> bool {
+    let mut result = false;
+    let mut members = std::ptr::null_mut();
+    let mut remain = 0;
+    let nmembers = if HEAP_LOCKED_UPGRADED(infomask) {
+        -1
+    } else {
+        GetMultiXactIdMembers(
+            multi,
+            &raw mut members,
+            false,
+            xmax_is_locked_only(infomask),
+        )
+    };
+
+    if nmembers >= 0 {
+        let members_slice = from_raw_parts_mut(members, nmembers as usize);
+        for m in members_slice {
+            let mem_xid = m.xid;
+            let mem_status = m.status;
+            if TransactionIdIsCurrentTransactionId(mem_xid) {
+                remain += 1;
+                continue;
+            }
+
+            if !DoLockModesConflict(
+                LOCKMODE_from_mxstatus!(mem_status),
+                LOCKMODE_from_mxstatus!(status),
+            ) {
+                if !remaining.is_null() && TransactionIdIsInProgress(mem_xid) {
+                    remain += 1
+                }
+                continue;
+            }
+
+            if nowait {
+                result = ConditionalXactLockTableWait(mem_xid);
+                if !result {
+                    break;
+                }
+            } else {
+                XactLockTableWait(mem_xid, rel, ctid, oper);
+            }
+        }
+
+        pfree(members.cast());
+    }
+    if !remaining.is_null() {
+        *remaining = remain;
+    }
+
+    result
 }
 
 #[pg_guard]

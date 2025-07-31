@@ -30,27 +30,28 @@ use pg_sys::{
     VISIBILITYMAP_VALID_BITS,
 };
 
-use pgrx::pg_sys::ForkNumber::*;
 use pgrx::pg_sys::LockTupleMode::LockTupleExclusive;
 use pgrx::pg_sys::LockWaitPolicy::LockWaitBlock;
-use pgrx::pg_sys::ScanOptions::*;
 use pgrx::pg_sys::TM_Result::*;
 use pgrx::pg_sys::TU_UpdateIndexes::{TU_All, TU_None, TU_Summarizing};
 use pgrx::pg_sys::XLTW_Oper::XLTW_Delete;
+use pgrx::pg_sys::{heap_fetch, ScanOptions::*};
+use pgrx::pg_sys::{BufferHeapTupleTableSlot, ForkNumber::*};
 
 // import functions
 use pgrx::pg_sys::{
     palloc, pfree, pgstat_count_heap_delete, read_stream_begin_relation, read_stream_end,
     read_stream_reset, smgrnblocks, visibilitymap_clear, visibilitymap_pin, BufferGetBlockNumber,
     BufferGetPage, BufferIsValid, ExecFetchSlotHeapTuple, ExecStoreBufferHeapTuple,
-    FreeAccessStrategy, GetCurrentTransactionId, HeapTupleHeaderAdjustCmax, HeapTupleHeaderGetCmax,
-    HeapTupleHeaderIsHeapOnly, HeapTupleHeaderIsOnlyLocked, HeapTupleSatisfiesUpdate,
-    IsInParallelMode, ItemPointerCopy, ItemPointerEquals, ItemPointerGetBlockNumber,
-    ItemPointerGetOffsetNumber, ItemPointerIndicatesMovedPartitions, ItemPointerIsValid,
-    LockBuffer, MarkBufferDirty, MultiXactIdSetOldestMember, PageClearAllVisible, PageGetItem,
-    PageGetItemId, PageIsAllVisible, ReadBuffer, RelationDecrementReferenceCount, RelationGetSmgr,
-    RelationIncrementReferenceCount, ReleaseBuffer, TransactionIdIsCurrentTransactionId,
-    UnlockReleaseBuffer, UnlockTuple, XactLockTableWait,
+    ExecStorePinnedBufferHeapTuple, FreeAccessStrategy, GetCurrentTransactionId,
+    HeapTupleHeaderAdjustCmax, HeapTupleHeaderGetCmax, HeapTupleHeaderIsHeapOnly,
+    HeapTupleHeaderIsOnlyLocked, HeapTupleSatisfiesUpdate, IsInParallelMode, ItemPointerCopy,
+    ItemPointerEquals, ItemPointerGetBlockNumber, ItemPointerGetOffsetNumber,
+    ItemPointerIndicatesMovedPartitions, ItemPointerIsValid, LockBuffer, MarkBufferDirty,
+    MultiXactIdSetOldestMember, PageClearAllVisible, PageGetItem, PageGetItemId, PageIsAllVisible,
+    ReadBuffer, RelationDecrementReferenceCount, RelationGetSmgr, RelationIncrementReferenceCount,
+    ReleaseBuffer, TransactionIdIsCurrentTransactionId, UnlockReleaseBuffer, UnlockTuple,
+    XactLockTableWait,
 };
 use pgrx::prelude::*;
 
@@ -278,12 +279,27 @@ unsafe extern "C-unwind" fn index_fetch_tuple(
 
 #[pg_guard]
 unsafe extern "C-unwind" fn tuple_fetch_row_version(
-    _rel: Relation,
-    _tid: ItemPointer,
-    _snapshot: Snapshot,
-    _slot: *mut TupleTableSlot,
+    rel: Relation,
+    tid: ItemPointer,
+    snapshot: Snapshot,
+    slot: *mut TupleTableSlot,
 ) -> bool {
-    todo!("tuple_fetch_row_version")
+    let bslot = slot as *mut BufferHeapTupleTableSlot;
+    let mut buffer = InvalidBuffer as i32;
+    (*bslot).base.tupdata.t_self = *tid;
+    // TODO: implement heap fetch
+    if heap_fetch(
+        rel,
+        snapshot,
+        &raw mut (*bslot).base.tupdata,
+        &raw mut buffer,
+        false,
+    ) {
+        ExecStorePinnedBufferHeapTuple(&raw mut (*bslot).base.tupdata, slot, buffer);
+        (*slot).tts_tableOid = RelationGetRelId!(rel);
+        return true;
+    }
+    false
 }
 
 #[pg_guard]

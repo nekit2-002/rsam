@@ -54,7 +54,7 @@ pub const tupleLockExtraInfo: [Info; (LockTupleExclusive + 1) as usize] = [
 ];
 
 #[allow(non_upper_case_globals)]
-const MultiXactStatusLock: [LockTupleMode::Type; (MultiXactStatusUpdate + 1) as usize] = [
+pub const MultiXactStatusLock: [LockTupleMode::Type; (MultiXactStatusUpdate + 1) as usize] = [
     LockTupleKeyShare,
     LockTupleShare,
     LockTupleNoKeyExclusive,
@@ -63,6 +63,24 @@ const MultiXactStatusLock: [LockTupleMode::Type; (MultiXactStatusUpdate + 1) as 
     LockTupleExclusive,
 ];
 const HEAP_XMAX_EXCL_LOCK: u16 = 0x0040;
+
+#[macro_export]
+macro_rules! TUPLOCK_from_mxstatus {
+    ($status:expr) => {
+        MultiXactStatusLock[$status as usize]
+    };
+}
+
+pub use TUPLOCK_from_mxstatus;
+
+#[macro_export]
+macro_rules! LOCKMODE_from_mxstatus {
+    ($status: expr) => {
+        tupleLockExtraInfo[TUPLOCK_from_mxstatus!($status) as usize].0
+    };
+}
+
+pub use LOCKMODE_from_mxstatus;
 
 #[inline]
 #[allow(non_snake_case)]
