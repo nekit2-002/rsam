@@ -1,25 +1,23 @@
-use std::result;
-
 use crate::am_handler_port::{new_table_am_routine, TableAmArgs, TableAmHandler, TableAmRoutine};
+use crate::delete::*;
 use crate::include::general::*;
 use crate::include::relaion_macro::*;
 use crate::insert::*;
 use crate::scan::fetcher::{heap_gettup, heap_gettup_pagemode};
 use crate::scan::visibility::*;
 use crate::scan::*;
-use crate::update::tuple_update;
-use crate::{delete::*, update};
+use crate::update::{fetch_tuple, tuple_update};
 
 // import types
 use pg_sys::{
-    BlockNumber, BufferAccessStrategy, BulkInsertStateData, CommandId, ForkNumber, HeapScanDesc,
-    HeapScanDescData, HeapTupleData, IndexBuildCallback, IndexFetchTableData, IndexInfo,
-    ItemPointer, LockTupleMode, LockWaitPolicy, MultiXactId, Oid, ParallelBlockTableScanWorkerData,
-    ParallelTableScanDesc, ParallelTableScanDescData, ReadStream, ReadStreamBlockNumberCB,
-    RelFileLocator, Relation, RelationData, SampleScanState, ScanDirection, ScanKey, ScanKeyData,
-    Snapshot, SnapshotData, TM_FailureData, TM_IndexDeleteOp, TM_Result, TU_UpdateIndexes,
-    TableScanDesc, TransactionId, TupleTableSlot, TupleTableSlotOps, VacuumParams,
-    ValidateIndexState,
+    BlockNumber, BufferAccessStrategy, BufferHeapTupleTableSlot, BulkInsertStateData, CommandId,
+    ForkNumber, ForkNumber::*, HeapScanDesc, HeapScanDescData, HeapTupleData, IndexBuildCallback,
+    IndexFetchTableData, IndexInfo, ItemPointer, LockTupleMode, LockWaitPolicy, MultiXactId, Oid,
+    ParallelBlockTableScanWorkerData, ParallelTableScanDesc, ParallelTableScanDescData, ReadStream,
+    ReadStreamBlockNumberCB, RelFileLocator, Relation, RelationData, SampleScanState,
+    ScanDirection, ScanKey, ScanKeyData, Snapshot, SnapshotData, TM_FailureData, TM_IndexDeleteOp,
+    TM_Result, TU_UpdateIndexes, TableScanDesc, TransactionId, TupleTableSlot, TupleTableSlotOps,
+    VacuumParams, ValidateIndexState,
 };
 
 // import constants
@@ -32,11 +30,10 @@ use pg_sys::{
 
 use pgrx::pg_sys::LockTupleMode::LockTupleExclusive;
 use pgrx::pg_sys::LockWaitPolicy::LockWaitBlock;
+use pgrx::pg_sys::ScanOptions::*;
 use pgrx::pg_sys::TM_Result::*;
 use pgrx::pg_sys::TU_UpdateIndexes::{TU_All, TU_None, TU_Summarizing};
 use pgrx::pg_sys::XLTW_Oper::XLTW_Delete;
-use pgrx::pg_sys::{heap_fetch, ScanOptions::*};
-use pgrx::pg_sys::{BufferHeapTupleTableSlot, ForkNumber::*};
 
 // import functions
 use pgrx::pg_sys::{
@@ -286,9 +283,11 @@ unsafe extern "C-unwind" fn tuple_fetch_row_version(
 ) -> bool {
     let bslot = slot as *mut BufferHeapTupleTableSlot;
     let mut buffer = InvalidBuffer as i32;
+    Assert((*slot).tts_ops == &TTSOpsBufferHeapTuple);
+
     (*bslot).base.tupdata.t_self = *tid;
-    // TODO: implement heap fetch
-    if heap_fetch(
+
+    if fetch_tuple(
         rel,
         snapshot,
         &raw mut (*bslot).base.tupdata,

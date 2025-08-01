@@ -1,10 +1,11 @@
+use crate::include::general::Assert;
 use pg_sys::SnapshotType::*;
 use pg_sys::{
-    Buffer, BufferIsPermanent, HeapTuple, HeapTupleGetUpdateXid,
-    HeapTupleHeaderGetCmax, HeapTupleHeaderGetCmin, HeapTupleHeaderGetRawXmin,
-    HeapTupleHeaderXminInvalid, InvalidOid, ItemPointerIsValid, MarkBufferDirtyHint, Snapshot,
-    TransactionIdDidCommit, TransactionIdFollowsOrEquals, TransactionIdGetCommitLSN,
-    TransactionIdIsCurrentTransactionId, XidInMVCCSnapshot,
+    Buffer, BufferIsPermanent, HeapTuple, HeapTupleGetUpdateXid, HeapTupleHeaderGetCmax,
+    HeapTupleHeaderGetCmin, HeapTupleHeaderGetRawXmin, HeapTupleHeaderXminInvalid, InvalidOid,
+    ItemPointerIsValid, MarkBufferDirtyHint, Snapshot, TransactionIdDidCommit,
+    TransactionIdFollowsOrEquals, TransactionIdGetCommitLSN, TransactionIdIsCurrentTransactionId,
+    XidInMVCCSnapshot,
 };
 use pgrx::pg_sys::{
     BufferGetLSNAtomic, HistoricSnapshotGetTupleCids, InvalidCommandId,
@@ -15,7 +16,6 @@ use pgrx::pg_sys::{
 };
 use pgrx::{pg_sys::HeapTupleHeaderData, prelude::*};
 use std::slice::from_raw_parts_mut;
-use crate::include::general::Assert;
 
 #[pg_guard]
 #[allow(non_snake_case)]
@@ -315,7 +315,12 @@ pub unsafe extern "C-unwind" fn tuple_satisfies_visibility(
 ) -> bool {
     match (*snapshot).snapshot_type {
         SNAPSHOT_MVCC => tuple_satisfies_mvcc(htup, snapshot, buffer),
+        SNAPSHOT_SELF => todo!(""),
+        SNAPSHOT_ANY => true,
+        SNAPSHOT_TOAST => todo!(""),
+        SNAPSHOT_DIRTY => todo!(""),
         SNAPSHOT_HISTORIC_MVCC => tuple_satisfies_historic_mvcc(htup, snapshot, buffer),
+        SNAPSHOT_NON_VACUUMABLE => false,
         _ => false,
     }
 }

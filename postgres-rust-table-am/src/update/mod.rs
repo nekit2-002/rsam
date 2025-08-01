@@ -1,28 +1,28 @@
 use pgrx::pg_sys::{
-    bms_add_member, bms_add_members, bms_free, bms_next_member, bms_overlap, heap_getattr, oper,
-    pfree, pgstat_count_heap_update, varattrib_1b, varlena, visibilitymap_clear, visibilitymap_pin,
+    bms_add_member, bms_add_members, bms_free, bms_next_member, bms_overlap, heap_getattr, pfree,
+    pgstat_count_heap_update, varattrib_1b, varlena, visibilitymap_clear, visibilitymap_pin,
     BufferGetBlockNumber, BufferGetPage, BufferIsValid, ConditionalXactLockTableWait, Datum,
     DatumGetObjectId, DatumGetPointer, DoLockModesConflict, FirstLowInvalidHeapAttributeNumber,
-    FormData_pg_attribute, GetCurrentTransactionId, GetMultiXactIdMembers, HeapTupleGetUpdateXid,
-    HeapTupleHeaderAdjustCmax, HeapTupleHeaderGetCmax, HeapTupleHeaderGetNatts,
-    HeapTupleSatisfiesUpdate, IsInParallelMode, ItemPointerEquals, ItemPointerGetBlockNumber,
-    ItemPointerGetOffsetNumber, ItemPointerIsValid, LockBuffer, MarkBufferDirty,
-    MultiXactIdSetOldestMember, PageClearAllVisible, PageGetHeapFreeSpace, PageGetItem,
-    PageGetItemId, PageIsAllVisible, PageSetFull, ReadBuffer, RelationGetIndexAttrBitmap,
-    RelationSupportsSysCache, ReleaseBuffer, Size, TableOidAttributeNumber, TransactionIdDidAbort,
-    TransactionIdIsCurrentTransactionId, TransactionIdIsInProgress, TupleDesc, UnlockReleaseBuffer,
-    UnlockTuple, XactLockTableWait, MAXALIGN,
+    FirstOffsetNumber, FormData_pg_attribute, GetCurrentTransactionId, GetMultiXactIdMembers,
+    HeapTupleGetUpdateXid, HeapTupleHeaderAdjustCmax, HeapTupleHeaderGetCmax,
+    HeapTupleHeaderGetNatts, HeapTupleSatisfiesUpdate, IsInParallelMode, ItemPointerEquals,
+    ItemPointerGetBlockNumber, ItemPointerGetOffsetNumber, ItemPointerIsValid, LockBuffer,
+    MarkBufferDirty, MultiXactIdSetOldestMember, PageClearAllVisible, PageGetHeapFreeSpace,
+    PageGetItem, PageGetItemId, PageGetMaxOffsetNumber, PageIsAllVisible, PageSetFull, ReadBuffer,
+    RelationGetIndexAttrBitmap, RelationSupportsSysCache, ReleaseBuffer, TableOidAttributeNumber,
+    TransactionIdDidAbort, TransactionIdIsCurrentTransactionId, TransactionIdIsInProgress,
+    TupleDesc, UnlockReleaseBuffer, UnlockTuple, XactLockTableWait, MAXALIGN,
 };
 use pgrx::pg_sys::{
-    Bitmapset, CommandId, HeapTuple, HeapTupleData, IndexAttrBitmapKind::*, ItemPointer,
+    Bitmapset, Buffer, CommandId, HeapTuple, HeapTupleData, IndexAttrBitmapKind::*, ItemPointer,
     LockTupleMode, LockTupleMode::*, MultiXactId, MultiXactStatus, MultiXactStatus::*, Relation,
     Snapshot, TM_FailureData, TM_Result, TM_Result::*, TU_UpdateIndexes, TU_UpdateIndexes::*,
     TransactionId, XLTW_Oper, XLTW_Oper::*, LOCKMODE,
 };
 use pgrx::pg_sys::{
     InvalidBuffer, InvalidCommandId, InvalidTransactionId, BUFFER_LOCK_EXCLUSIVE,
-    BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK, HEAP_HOT_UPDATED, HEAP_KEYS_UPDATED, HEAP_MOVED,
-    HEAP_ONLY_TUPLE, HEAP_UPDATED, HEAP_XACT_MASK, HEAP_XMAX_BITS, HEAP_XMAX_INVALID,
+    BUFFER_LOCK_SHARE, BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK, HEAP_HOT_UPDATED, HEAP_KEYS_UPDATED,
+    HEAP_MOVED, HEAP_ONLY_TUPLE, HEAP_UPDATED, HEAP_XACT_MASK, HEAP_XMAX_BITS, HEAP_XMAX_INVALID,
     HEAP_XMAX_IS_MULTI, HEAP_XMAX_KEYSHR_LOCK, HEAP_XMAX_LOCK_ONLY, VISIBILITYMAP_VALID_BITS,
 };
 
@@ -37,7 +37,7 @@ use crate::insert::{
     heap_tuple_header_set_Xmin, relation_put_tuple, RelationGetBufferForTuple,
 };
 use crate::scan::visibility::{tuple_satisfies_visibility, xmax_is_locked_only};
-use crate::{delete::*, RelationGetDescr};
+use crate::{delete::*, RelationGetDescr, RelationGetRelId};
 
 // #[pg_guard]
 // #[allow(non_snake_case)]
@@ -866,4 +866,85 @@ pub unsafe extern "C-unwind" fn tuple_update(
     bms_free(interesting_attrs);
 
     TM_Ok
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn SerializationNeededForRead(rel: Relation, snapshot: Snapshot) {
+    // if  {
+
+    // }
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn PredicateLockTID(
+    rel: Relation,
+    tid: ItemPointer,
+    snapshot: Snapshot,
+    tuple_xid: TransactionId,
+) {
+    // if  {
+
+    // }
+}
+
+#[pg_guard]
+pub unsafe extern "C-unwind" fn fetch_tuple(
+    rel: Relation,
+    snapshot: Snapshot,
+    tup: HeapTuple,
+    user_buf: *mut Buffer,
+    keep_buf: bool,
+) -> bool {
+    let tid = &raw mut (*tup).t_self;
+    let buffer = ReadBuffer(rel, ItemPointerGetBlockNumber(tid));
+
+    LockBuffer(buffer, BUFFER_LOCK_SHARE as i32);
+
+    let page = BufferGetPage(buffer);
+    let offnum = ItemPointerGetOffsetNumber(tid);
+
+    if offnum < FirstOffsetNumber || offnum > PageGetMaxOffsetNumber(page) {
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+        ReleaseBuffer(buffer);
+        *user_buf = InvalidBuffer as i32;
+        (*tup).t_data = std::ptr::null_mut();
+        return false;
+    }
+
+    let lp = PageGetItemId(page, offnum);
+    if !ItemIdIsNormal!(lp) {
+        LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+        ReleaseBuffer(buffer);
+        *user_buf = InvalidBuffer as i32;
+        (*tup).t_data = std::ptr::null_mut();
+        return false;
+    }
+
+    (*tup).t_data = PageGetItem(page, lp).cast();
+    (*tup).t_len = (*lp).lp_len();
+    (*tup).t_tableOid = RelationGetRelId!(rel);
+
+    let valid = tuple_satisfies_visibility(tup, snapshot, buffer);
+    if valid {
+        // PredicateLockTID(
+        //     rel,
+        //     &raw mut (*tup).t_self,
+        //     snapshot,
+        //     HeapTupleHeaderGetXmin((*tup).t_data),
+        // );
+    }
+    LockBuffer(buffer, BUFFER_LOCK_UNLOCK as i32);
+    if valid {
+        *user_buf = buffer;
+        return true;
+    }
+
+    *user_buf = if keep_buf {
+        buffer
+    } else {
+        ReleaseBuffer(buffer);
+        (*tup).t_data = std::ptr::null_mut();
+        InvalidBuffer as i32
+    };
+    false
 }
