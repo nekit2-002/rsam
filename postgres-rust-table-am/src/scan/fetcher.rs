@@ -5,15 +5,15 @@ use pg_sys::{
     InvalidBlockNumber, InvalidBuffer, ItemId, ItemPointerSet, ItemPointerSetBlockNumber,
     ItemPointerSetOffsetNumber, LockBuffer, OffsetNumber, Page, PageGetItem, PageGetItemId,
     PageGetMaxOffsetNumber, ReleaseBuffer, ScanKeyData, TupleDesc, BUFFER_LOCK_SHARE,
-    BUFFER_LOCK_UNLOCK, SK_ISNULL, HeapTupleSatisfiesVisibility
+    BUFFER_LOCK_UNLOCK, SK_ISNULL,
 };
 
 use crate::include::general::*;
 use crate::include::relaion_macro::RelationGetDescr;
+use crate::scan::visibility::*;
 use pg_sys::ScanDirection::*;
 use pgrx::{pg_sys::ScanDirection, prelude::*};
 use std::cmp::min;
-use crate::scan::visibility::*;
 
 #[macro_export]
 macro_rules! partial_loop {
@@ -264,12 +264,8 @@ pub unsafe extern "C-unwind" fn heap_gettup(
                 (*tuple).t_len = (*lpp).lp_len();
                 ItemPointerSet(&raw mut (*tuple).t_self, (*scan).rs_cblock, line_offset);
 
-                let visible = tuple_satisfies_visibility(
-                // let visible = HeapTupleSatisfiesVisibility(
-                    tuple,
-                    (*scan).rs_base.rs_snapshot,
-                    (*scan).rs_cbuf,
-                );
+                let visible =
+                    tuple_satisfies_visibility(tuple, (*scan).rs_base.rs_snapshot, (*scan).rs_cbuf);
 
                 if !visible {
                     lines_left -= 1;

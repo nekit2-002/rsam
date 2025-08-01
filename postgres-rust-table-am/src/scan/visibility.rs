@@ -320,7 +320,7 @@ pub unsafe extern "C-unwind" fn tuple_satisfies_visibility(
         SNAPSHOT_TOAST => todo!(""),
         SNAPSHOT_DIRTY => todo!(""),
         SNAPSHOT_HISTORIC_MVCC => tuple_satisfies_historic_mvcc(htup, snapshot, buffer),
-        SNAPSHOT_NON_VACUUMABLE => false,
+        SNAPSHOT_NON_VACUUMABLE => todo!(""),
         _ => false,
     }
 }
