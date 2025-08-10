@@ -768,6 +768,11 @@ unsafe extern "C-unwind" fn index_validate_scan(
 }
 
 #[pg_guard]
+/*
+ Return the current size of `rel` in bytes. If `forkNumber` is
+ InvalidForkNumber, return the relation's overall size, otherwise the size
+ for the indicated fork.
+*/
 unsafe extern "C-unwind" fn relation_size(rel: Relation, fork_number: ForkNumber::Type) -> u64 {
     let mut nblocks: u64 = 0;
     if fork_number == InvalidForkNumber {
@@ -787,6 +792,18 @@ unsafe extern "C-unwind" fn relation_needs_toast_table(_rel: Relation) -> bool {
 }
 
 #[pg_guard]
+/*
+Estimate the current size of the relation.
+
+Parameter info:
+ estimate_rel_size - estimate # pages and # tuples in a table or index
+ We also estimate the fraction of the pages that are marked all-visible in
+ the visibility map, for use in estimation of index-only scans.
+
+  If attr_widths isn't NULL, it points to the zero-index entry of the
+  relation's attr_widths[] cache; we fill this in if we have need to compute
+  the attribute widths for estimation purposes.
+*/
 unsafe extern "C-unwind" fn relation_estimate_size(
     rel: Relation,
     attr_widths: *mut i32,
