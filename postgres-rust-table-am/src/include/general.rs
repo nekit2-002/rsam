@@ -48,3 +48,25 @@ macro_rules! IsMVCCSnapshot {
 }
 
 pub use IsMVCCSnapshot;
+
+#[macro_export]
+macro_rules! GetPerTupleExprContext {
+    ($estate: expr) => {
+        if !(*$estate).es_per_tuple_exprcontext.is_null() {
+            (*$estate).es_per_tuple_exprcontext
+        } else {
+            pgrx::pg_sys::MakePerTupleExprContext($estate)
+        }
+    };
+}
+
+pub use GetPerTupleExprContext;
+
+#[macro_export]
+macro_rules! OffsetNumberIsValid {
+    ($offnum:expr) => {
+        $offnum != 0 && $offnum <= pgrx::pg_sys::MaxOffsetNumber
+    };
+}
+
+pub use OffsetNumberIsValid;

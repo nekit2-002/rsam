@@ -37,17 +37,21 @@ macro_rules! MaxHeapTupleSize {
 #[macro_export]
 macro_rules! MaxHeapTuplesPerPage {
     () => {
-        (BLCKSZ as usize - SizeOfPageHeaderData())
-            / (MAXALIGN(SizeOfHeapTupleHeader!()) + std::mem::size_of::<ItemIdData>())
+        (BLCKSZ as usize - pgrx::pg_sys::SizeOfPageHeaderData())
+            / (pgrx::pg_sys::MAXALIGN(SizeOfHeapTupleHeader!())
+                + std::mem::size_of::<pgrx::pg_sys::ItemIdData>())
     };
 }
 
+pub use MaxHeapTuplesPerPage;
 #[macro_export]
 macro_rules! SizeOfHeapTupleHeader {
     () => {
-        std::mem::offset_of!(HeapTupleHeaderData, t_bits)
+        std::mem::offset_of!(pgrx::pg_sys::HeapTupleHeaderData, t_bits)
     };
 }
+
+pub use SizeOfHeapTupleHeader;
 
 #[macro_export]
 macro_rules! MinHeapTupleSize {

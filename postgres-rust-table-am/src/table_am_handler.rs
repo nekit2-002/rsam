@@ -13,16 +13,16 @@ use pg_sys::{
     BlockNumber, BufferAccessStrategy, BufferHeapTupleTableSlot, BulkInsertStateData, CommandId,
     ForkNumber, ForkNumber::*, HeapScanDesc, HeapScanDescData, HeapTupleData, IndexBuildCallback,
     IndexFetchTableData, IndexInfo, ItemPointer, LockTupleMode, LockWaitPolicy, MultiXactId, Oid,
-    ParallelBlockTableScanWorkerData, ParallelTableScanDesc, ParallelTableScanDescData, ReadStream,
-    ReadStreamBlockNumberCB, RelFileLocator, Relation, RelationData, SampleScanState,
-    ScanDirection, ScanKey, ScanKeyData, Snapshot, SnapshotData, TM_FailureData, TM_IndexDeleteOp,
-    TM_Result, TU_UpdateIndexes, TableScanDesc, TransactionId, TupleTableSlot, TupleTableSlotOps,
-    VacuumParams, ValidateIndexState,
+    ParallelBlockTableScanDesc, ParallelBlockTableScanWorkerData, ParallelTableScanDesc,
+    ParallelTableScanDescData, ReadStream, ReadStreamBlockNumberCB, RelFileLocator, Relation,
+    RelationData, SampleScanState, ScanDirection, ScanKey, ScanKeyData, Snapshot, SnapshotData,
+    TM_FailureData, TM_IndexDeleteOp, TM_Result, TU_UpdateIndexes, TableScanDesc, TransactionId,
+    TupleTableSlot, TupleTableSlotOps, VacuumParams, ValidateIndexState,
 };
 
 // import constants
 use pg_sys::{
-    InvalidBuffer, InvalidCommandId, InvalidTransactionId, TTSOpsBufferHeapTuple, BLCKSZ,
+    InvalidBuffer, InvalidCommandId, InvalidTransactionId, Mode, TTSOpsBufferHeapTuple, BLCKSZ,
     BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK, HEAP_HOT_UPDATED, HEAP_KEYS_UPDATED, HEAP_MOVED,
     HEAP_XMAX_BITS, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, READ_STREAM_SEQUENTIAL,
     VISIBILITYMAP_VALID_BITS,
@@ -30,25 +30,37 @@ use pg_sys::{
 
 use pgrx::pg_sys::LockTupleMode::LockTupleExclusive;
 use pgrx::pg_sys::LockWaitPolicy::LockWaitBlock;
-use pgrx::pg_sys::ScanOptions::*;
-use pgrx::pg_sys::TM_Result::*;
+use pgrx::pg_sys::ProcessingMode::BootstrapProcessing;
+use pgrx::pg_sys::ScanDirection::ForwardScanDirection;
 use pgrx::pg_sys::TU_UpdateIndexes::{TU_All, TU_None, TU_Summarizing};
 use pgrx::pg_sys::XLTW_Oper::XLTW_Delete;
+use pgrx::pg_sys::{bsysscan, CheckXidAlive, HTSV_Result::*};
+use pgrx::pg_sys::{
+    heap_get_root_tuples, heap_setscanlimits, table_endscan, table_slot_create, BlockIdData,
+    CreateExecutorState, ExecDropSingleTupleTableSlot, ExecQual, FormIndexDatum, FreeExecutorState,
+    GetTransactionSnapshot, HeapTupleHeaderIsHotUpdated, InvalidBlockNumber, ItemPointerData,
+    ItemPointerSet, MemoryContextReset, OffsetNumber, RegisterSnapshot, ScanOptions::*,
+    SnapshotAnyData, UnregisterSnapshot, BUFFER_LOCK_SHARE, INDEX_MAX_KEYS,
+    PROGRESS_SCAN_BLOCKS_DONE, PROGRESS_SCAN_BLOCKS_TOTAL,
+};
+use pgrx::pg_sys::{IsSystemRelation, TM_Result::*};
 
 // import functions
 use pgrx::pg_sys::{
-    palloc, pfree, pgstat_count_heap_delete, read_stream_begin_relation, read_stream_end,
-    read_stream_reset, smgrnblocks, visibilitymap_clear, visibilitymap_pin, BufferGetBlockNumber,
-    BufferGetPage, BufferIsValid, ExecFetchSlotHeapTuple, ExecStoreBufferHeapTuple,
-    ExecStorePinnedBufferHeapTuple, FreeAccessStrategy, GetCurrentTransactionId,
-    HeapTupleHeaderAdjustCmax, HeapTupleHeaderGetCmax, HeapTupleHeaderIsHeapOnly,
-    HeapTupleHeaderIsOnlyLocked, HeapTupleSatisfiesUpdate, IsInParallelMode, ItemPointerCopy,
-    ItemPointerEquals, ItemPointerGetBlockNumber, ItemPointerGetOffsetNumber,
-    ItemPointerIndicatesMovedPartitions, ItemPointerIsValid, LockBuffer, MarkBufferDirty,
-    MultiXactIdSetOldestMember, PageClearAllVisible, PageGetItem, PageGetItemId, PageIsAllVisible,
-    ReadBuffer, RelationDecrementReferenceCount, RelationGetSmgr, RelationIncrementReferenceCount,
-    ReleaseBuffer, TransactionIdIsCurrentTransactionId, UnlockReleaseBuffer, UnlockTuple,
-    XactLockTableWait,
+    heap_getnext, palloc, pfree, pgstat_count_heap_delete, pgstat_progress_update_param,
+    read_stream_begin_relation, read_stream_end, read_stream_reset, smgrnblocks,
+    table_beginscan_strat, visibilitymap_clear, visibilitymap_pin, BufferGetBlockNumber,
+    BufferGetPage, BufferIsValid, ExecFetchSlotHeapTuple, ExecPrepareQual,
+    ExecStoreBufferHeapTuple, ExecStorePinnedBufferHeapTuple, FreeAccessStrategy,
+    GetCurrentTransactionId, GetOldestNonRemovableTransactionId, HeapTupleHeaderAdjustCmax,
+    HeapTupleHeaderGetCmax, HeapTupleHeaderGetXmin, HeapTupleHeaderIsHeapOnly,
+    HeapTupleHeaderIsOnlyLocked, HeapTupleSatisfiesUpdate, HeapTupleSatisfiesVacuum,
+    IsInParallelMode, ItemPointerCopy, ItemPointerEquals, ItemPointerGetBlockNumber,
+    ItemPointerGetOffsetNumber, ItemPointerIndicatesMovedPartitions, ItemPointerIsValid,
+    LockBuffer, MarkBufferDirty, MultiXactIdSetOldestMember, PageClearAllVisible, PageGetItem,
+    PageGetItemId, PageIsAllVisible, ReadBuffer, RelationDecrementReferenceCount, RelationGetSmgr,
+    RelationIncrementReferenceCount, ReleaseBuffer, TransactionIdIsCurrentTransactionId,
+    UnlockReleaseBuffer, UnlockTuple, XactLockTableWait,
 };
 use pgrx::prelude::*;
 
@@ -248,6 +260,7 @@ unsafe extern "C-unwind" fn parallelscan_reinitialize(
 }
 
 #[pg_guard]
+// in case we attempt to insert values by the same primary key
 unsafe extern "C-unwind" fn index_fetch_begin(_rel: Relation) -> *mut IndexFetchTableData {
     todo!("index_fetch_begin")
 }
@@ -740,20 +753,397 @@ unsafe extern "C-unwind" fn scan_analyze_next_tuple(
 }
 
 #[pg_guard]
+unsafe extern "C-unwind" fn scan_get_blocks_done(hscan: HeapScanDesc) -> BlockNumber {
+    let mut bpscan: ParallelBlockTableScanDesc = std::ptr::null_mut();
+    let startblock = if !(*hscan).rs_base.rs_parallel.is_null() {
+        bpscan = (*hscan).rs_base.rs_parallel.cast();
+        (*bpscan).phs_startblock
+    } else {
+        (*hscan).rs_startblock
+    };
+
+    if (*hscan).rs_cblock > startblock {
+        (*hscan).rs_cblock - startblock
+    } else {
+        let nblocks = if !bpscan.is_null() {
+            (*bpscan).phs_nblocks
+        } else {
+            (*hscan).rs_nblocks
+        };
+        nblocks - startblock + (*hscan).rs_cblock
+    }
+}
+
+#[pg_guard]
+unsafe extern "C-unwind" fn primary_index_get_next(
+    scan: TableScanDesc,
+    direction: ScanDirection::Type,
+) -> *mut HeapTupleData {
+    let scan: HeapScanDesc = scan.cast();
+    if CheckXidAlive != 0.into() && !bsysscan {
+        ereport!(
+            PgLogLevel::ERROR,
+            PgSqlErrorCode::ERRCODE_ADMIN_SHUTDOWN,
+            "unexpected heap_getnext call during logical decoding"
+        );
+    }
+
+    if ((*scan).rs_base.rs_flags & SO_ALLOW_PAGEMODE) != 0 {
+        heap_gettup_pagemode(
+            scan,
+            direction,
+            (*scan).rs_base.rs_nkeys,
+            (*scan).rs_base.rs_key,
+        );
+    } else {
+        heap_gettup(
+            scan,
+            direction,
+            (*scan).rs_base.rs_nkeys,
+            (*scan).rs_base.rs_key,
+        );
+    }
+
+    if (*scan).rs_ctup.t_data.is_null() {
+        return std::ptr::null_mut();
+    }
+
+    pgstat_count_heap_getnext((*scan).rs_base.rs_rd);
+
+    &raw mut (*scan).rs_ctup
+}
+
+const NTUPS: usize = unsafe { MaxHeapTuplesPerPage!() };
+#[pg_guard]
 unsafe extern "C-unwind" fn index_build_range_scan(
-    _table_rel: Relation,
-    _index_rel: Relation,
-    _index_info: *mut IndexInfo,
-    _allow_sync: bool,
-    _anyvisible: bool,
-    _progress: bool,
-    _start_blockno: BlockNumber,
-    _numblocks: BlockNumber,
-    _callback: IndexBuildCallback,
-    _callback_state: *mut ::core::ffi::c_void,
-    _scan: TableScanDesc,
+    table_rel: Relation,
+    index_rel: Relation,
+    index_info: *mut IndexInfo,
+    allow_sync: bool,
+    anyvisible: bool,
+    progress: bool,
+    start_blockno: BlockNumber,
+    numblocks: BlockNumber,
+    callback: IndexBuildCallback,
+    callback_state: *mut ::core::ffi::c_void,
+    scan: TableScanDesc,
 ) -> f64 {
-    todo!("index_build_range_scan")
+    let mut values = [pgrx::pg_sys::Datum::null(); INDEX_MAX_KEYS as usize];
+    let mut isnull = [true; INDEX_MAX_KEYS as usize];
+    let mut need_unregister_snapshot = false;
+    let mut prev_blockn = InvalidBlockNumber;
+    let mut root_blockn = InvalidBlockNumber;
+    let mut root_offsets = [0; NTUPS];
+
+    Assert((*(*index_rel).rd_rel).relam != 0.into());
+    let is_system_catalog = IsSystemRelation(table_rel);
+    let checking_uniqueness = (*index_info).ii_Unique || !(*index_info).ii_ExclusionOps.is_null();
+    Assert(!(anyvisible && checking_uniqueness));
+    let estate = CreateExecutorState();
+    let econtext = GetPerTupleExprContext!(estate);
+    let slot = table_slot_create(table_rel, std::ptr::null_mut());
+
+    (*econtext).ecxt_scantuple = slot;
+    let predicate = ExecPrepareQual((*index_info).ii_Predicate, estate);
+    let oldest_xmin = if Mode != BootstrapProcessing && !(*index_info).ii_Concurrent {
+        GetOldestNonRemovableTransactionId(table_rel)
+    } else {
+        InvalidTransactionId
+    };
+
+    let (scan, snapshot) = if scan.is_null() {
+        let snapshot = if oldest_xmin == 0.into() {
+            need_unregister_snapshot = true;
+            RegisterSnapshot(GetTransactionSnapshot())
+        } else {
+            &raw mut SnapshotAnyData
+        };
+        (
+            table_beginscan_strat(
+                table_rel,
+                snapshot,
+                0,
+                std::ptr::null_mut(),
+                true,
+                allow_sync,
+            ),
+            snapshot,
+        )
+    } else {
+        Assert(Mode != BootstrapProcessing);
+        Assert(allow_sync);
+        (scan, (*scan).rs_snapshot)
+    };
+
+    let hscan: HeapScanDesc = scan.cast();
+    Assert(snapshot == &raw mut SnapshotAnyData || IsMVCCSnapshot!(snapshot));
+    Assert(if snapshot == &raw mut SnapshotAnyData {
+        oldest_xmin != 0.into()
+    } else {
+        oldest_xmin != 0.into()
+    });
+    Assert(snapshot == &raw mut SnapshotAnyData || !anyvisible);
+
+    if progress {
+        let nblocks = if !(*hscan).rs_base.rs_parallel.is_null() {
+            let pbscan: ParallelBlockTableScanDesc = (*hscan).rs_base.rs_parallel.cast();
+            (*pbscan).phs_nblocks
+        } else {
+            (*hscan).rs_nblocks
+        } as i64;
+
+        pgstat_progress_update_param(PROGRESS_SCAN_BLOCKS_TOTAL as i32, nblocks);
+    }
+
+    if !allow_sync {
+        heap_setscanlimits(scan, start_blockno, numblocks);
+    } else {
+        Assert(start_blockno == 0);
+        Assert(numblocks == InvalidBlockNumber);
+    }
+
+    let mut reltuples = 0.0;
+
+    // let mut heap_tuple = heap_getnext(scan, ForwardScanDirection);
+    let mut heap_tuple = primary_index_get_next(scan, ForwardScanDirection);
+    while !heap_tuple.is_null() {
+        let mut tupleIsAlive = true;
+        if progress {
+            let blocks_done = scan_get_blocks_done(hscan);
+            if blocks_done != prev_blockn {
+                pgstat_progress_update_param(PROGRESS_SCAN_BLOCKS_DONE as i32, blocks_done as i64);
+                prev_blockn = blocks_done;
+            }
+        }
+
+        if (*hscan).rs_cblock != root_blockn {
+            let page = BufferGetPage((*hscan).rs_cbuf);
+            LockBuffer((*hscan).rs_cbuf, BUFFER_LOCK_SHARE as i32);
+            heap_get_root_tuples(page, root_offsets.as_mut_ptr());
+            LockBuffer((*hscan).rs_cbuf, BUFFER_LOCK_UNLOCK as i32);
+            root_blockn = (*hscan).rs_cblock;
+        }
+
+        if snapshot == &raw mut SnapshotAnyData {
+            // let mut indexIt = false;
+            // let mut xwait: TransactionId = 0.into();
+
+            let indexIt = loop {
+                LockBuffer((*hscan).rs_cbuf, BUFFER_LOCK_SHARE as i32);
+                let indexIt =
+                    match HeapTupleSatisfiesVacuum(heap_tuple, oldest_xmin, (*hscan).rs_cbuf) {
+                        HEAPTUPLE_DEAD => {
+                            // indexIt = false;
+                            tupleIsAlive = false;
+                            false
+                        }
+                        HEAPTUPLE_LIVE => {
+                            // indexIt = true;
+                            tupleIsAlive = true;
+                            reltuples += 1f64;
+                            true
+                        }
+                        HEAPTUPLE_RECENTLY_DEAD => {
+                            let indexIt = if HeapTupleHeaderIsHotUpdated((*heap_tuple).t_data) {
+                                (*index_info).ii_BrokenHotChain = true;
+                                false
+                            } else {
+                                true
+                            };
+                            tupleIsAlive = false;
+                            indexIt
+                        }
+                        HEAPTUPLE_INSERT_IN_PROGRESS => {
+                            if anyvisible {
+                                // indexIt = true;
+                                tupleIsAlive = true;
+                                reltuples += 1f64;
+                                break true;
+                            }
+                            let xwait = HeapTupleHeaderGetXmin((*heap_tuple).t_data);
+                            if !TransactionIdIsCurrentTransactionId(xwait) {
+                                if !is_system_catalog {
+                                    ereport!(
+                                        PgLogLevel::WARNING,
+                                        PgSqlErrorCode::ERRCODE_CANNOT_COERCE,
+                                        "concurrent insert in progress within table"
+                                    )
+                                }
+                                if checking_uniqueness {
+                                    LockBuffer((*hscan).rs_cbuf, BUFFER_LOCK_UNLOCK as i32);
+                                    XactLockTableWait(
+                                        xwait,
+                                        table_rel,
+                                        &raw mut (*heap_tuple).t_self,
+                                        pgrx::pg_sys::XLTW_Oper::XLTW_InsertIndexUnique,
+                                    );
+
+                                    //  CHECK_FOR_INTERRUPTS();
+                                    continue;
+                                }
+                            } else {
+                                reltuples += 1f64;
+                            }
+                            // indexIt = true;
+                            tupleIsAlive = true;
+                            true
+                        }
+                        HEAPTUPLE_DELETE_IN_PROGRESS => {
+                            if anyvisible {
+                                // indexIt = true;
+                                tupleIsAlive = false;
+                                reltuples += 1f64;
+                                break true;
+                            }
+
+                            let xwait = tuple_header_get_update_xid((*heap_tuple).t_data);
+                            let indexIt = if !TransactionIdIsCurrentTransactionId(xwait) {
+                                if !is_system_catalog {
+                                    ereport!(
+                                        PgLogLevel::WARNING,
+                                        PgSqlErrorCode::ERRCODE_CANNOT_COERCE,
+                                        "concurrent delete in progress within table"
+                                    )
+                                }
+
+                                if checking_uniqueness
+                                    || HeapTupleHeaderIsHotUpdated((*heap_tuple).t_data)
+                                {
+                                    LockBuffer((*hscan).rs_cbuf, BUFFER_LOCK_UNLOCK as i32);
+                                    XactLockTableWait(
+                                        xwait,
+                                        table_rel,
+                                        &raw mut (*heap_tuple).t_self,
+                                        pgrx::pg_sys::XLTW_Oper::XLTW_InsertIndexUnique,
+                                    );
+                                    //  CHECK_FOR_INTERRUPTS();
+                                    continue;
+                                }
+
+                                // indexIt = true;
+                                reltuples += 1f64;
+                                true
+                            } else if HeapTupleHeaderIsHotUpdated((*heap_tuple).t_data) {
+                                // indexIt = false;
+                                (*index_info).ii_BrokenHotChain = true;
+                                false
+                            } else {
+                                true
+                            };
+                            tupleIsAlive = false;
+                            indexIt
+                        }
+                        _ => {
+                            ereport!(
+                                PgLogLevel::ERROR,
+                                PgSqlErrorCode::ERRCODE_CASE_NOT_FOUND,
+                                "unexpected HeapTupleSatisfiesVacuum result"
+                            );
+                            // indexIt = false;
+                            tupleIsAlive = false;
+                            false
+                        }
+                    };
+                break indexIt;
+            };
+
+            LockBuffer((*hscan).rs_cbuf, BUFFER_LOCK_UNLOCK as i32);
+            if !indexIt {
+                heap_tuple = heap_getnext(scan, ForwardScanDirection);
+                continue;
+            }
+        } else {
+            tupleIsAlive = true;
+            reltuples += 1f64;
+        };
+
+        MemoryContextReset((*econtext).ecxt_per_tuple_memory);
+        ExecStoreBufferHeapTuple(heap_tuple, slot, (*hscan).rs_cbuf);
+        if !predicate.is_null() {
+            if !ExecQual(predicate, econtext) {
+                heap_tuple = heap_getnext(scan, ForwardScanDirection);
+                continue;
+            }
+        }
+
+        FormIndexDatum(
+            index_info,
+            slot,
+            estate,
+            values.as_mut_ptr(),
+            isnull.as_mut_ptr(),
+        );
+        if HeapTupleHeaderIsHeapOnly((*heap_tuple).t_data) {
+            let mut tid: ItemPointerData = unsafe { std::mem::MaybeUninit::zeroed().assume_init() };
+            let offnum = ItemPointerGetOffsetNumber(&raw const (*heap_tuple).t_self) as usize;
+            if root_offsets[offnum - 1] == 0 {
+                let page = BufferGetPage((*hscan).rs_cbuf);
+                LockBuffer((*hscan).rs_cbuf, BUFFER_LOCK_SHARE as i32);
+                heap_get_root_tuples(page, root_offsets.as_mut_ptr());
+                LockBuffer((*hscan).rs_cbuf, BUFFER_LOCK_UNLOCK as i32);
+            }
+
+            if !OffsetNumberIsValid!(root_offsets[offnum - 1]) {
+                ereport!(
+                    PgLogLevel::ERROR,
+                    PgSqlErrorCode::ERRCODE_DATA_CORRUPTED,
+                    "failed to find parent tuple for heap-only tuple"
+                )
+            }
+
+            ItemPointerSet(
+                &raw mut tid,
+                ItemPointerGetBlockNumber(&raw const (*heap_tuple).t_self),
+                root_offsets[offnum - 1],
+            );
+
+            callback.map(|f| {
+                f(
+                    index_rel,
+                    &raw mut tid,
+                    values.as_mut_ptr(),
+                    isnull.as_mut_ptr(),
+                    tupleIsAlive,
+                    callback_state,
+                )
+            });
+        } else {
+            callback.map(|f| {
+                f(
+                    index_rel,
+                    &raw mut (*heap_tuple).t_self,
+                    values.as_mut_ptr(),
+                    isnull.as_mut_ptr(),
+                    tupleIsAlive,
+                    callback_state,
+                )
+            });
+        }
+    }
+
+    if progress {
+        let blocks_done = if !(*hscan).rs_base.rs_parallel.is_null() {
+            let pbscan: ParallelBlockTableScanDesc = (*hscan).rs_base.rs_parallel.cast();
+            (*pbscan).phs_nblocks
+        } else {
+            (*hscan).rs_nblocks
+        } as i64;
+
+        pgstat_progress_update_param(PROGRESS_SCAN_BLOCKS_DONE as i32, blocks_done);
+    }
+
+    table_endscan(scan);
+
+    if need_unregister_snapshot {
+        UnregisterSnapshot(snapshot);
+    }
+
+    ExecDropSingleTupleTableSlot(slot);
+    FreeExecutorState(estate);
+    (*index_info).ii_ExpressionsState = std::ptr::null_mut();
+    (*index_info).ii_PredicateState = std::ptr::null_mut();
+
+    reltuples
 }
 
 #[pg_guard]
@@ -780,6 +1170,7 @@ unsafe extern "C-unwind" fn relation_size(rel: Relation, fork_number: ForkNumber
             nblocks += smgrnblocks(RelationGetSmgr(rel), i) as u64;
         }
     } else {
+        // got here while debugging with fork_number = 0
         nblocks = smgrnblocks(RelationGetSmgr(rel), fork_number) as u64;
     }
 
