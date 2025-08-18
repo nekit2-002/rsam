@@ -34,7 +34,10 @@ use pgrx::pg_sys::ProcessingMode::BootstrapProcessing;
 use pgrx::pg_sys::ScanDirection::ForwardScanDirection;
 use pgrx::pg_sys::TU_UpdateIndexes::{TU_All, TU_None, TU_Summarizing};
 use pgrx::pg_sys::XLTW_Oper::XLTW_Delete;
-use pgrx::pg_sys::{bsysscan, CheckXidAlive, HTSV_Result::*};
+use pgrx::pg_sys::{
+    bsysscan, heap_hot_search_buffer, heap_page_prune_opt, palloc0, CheckXidAlive, HTSV_Result::*,
+    IndexFetchHeapData, ReleaseAndReadBuffer,
+};
 use pgrx::pg_sys::{
     heap_get_root_tuples, heap_setscanlimits, table_endscan, table_slot_create, BlockIdData,
     CreateExecutorState, ExecDropSingleTupleTableSlot, ExecQual, FormIndexDatum, FreeExecutorState,
@@ -261,30 +264,76 @@ unsafe extern "C-unwind" fn parallelscan_reinitialize(
 
 #[pg_guard]
 // in case we attempt to insert values by the same primary key
-unsafe extern "C-unwind" fn index_fetch_begin(_rel: Relation) -> *mut IndexFetchTableData {
-    todo!("index_fetch_begin")
+unsafe extern "C-unwind" fn index_fetch_begin(rel: Relation) -> *mut IndexFetchTableData {
+    let hscan: *mut IndexFetchHeapData = palloc0(std::mem::size_of::<IndexFetchHeapData>()).cast();
+    (*hscan).xs_base.rel = rel;
+    (*hscan).xs_cbuf = InvalidBuffer as i32;
+    &raw mut (*hscan).xs_base
 }
 
 #[pg_guard]
-unsafe extern "C-unwind" fn index_fetch_reset(_data: *mut IndexFetchTableData) {
-    todo!("index_fetch_reset")
+unsafe extern "C-unwind" fn index_fetch_reset(scan: *mut IndexFetchTableData) {
+    let hscan: *mut IndexFetchHeapData = scan.cast();
+    if BufferIsValid((*hscan).xs_cbuf) {
+        ReleaseBuffer((*hscan).xs_cbuf);
+        (*hscan).xs_cbuf = InvalidBuffer as i32;
+    }
 }
 
 #[pg_guard]
-unsafe extern "C-unwind" fn index_fetch_end(_data: *mut IndexFetchTableData) {
-    todo!("index_fetch_end")
+unsafe extern "C-unwind" fn index_fetch_end(scan: *mut IndexFetchTableData) {
+    let hscan: *mut IndexFetchHeapData = scan.cast();
+    index_fetch_reset(scan);
+    pfree(hscan.cast());
 }
 
 #[pg_guard]
 unsafe extern "C-unwind" fn index_fetch_tuple(
-    _scan: *mut IndexFetchTableData,
-    _tid: ItemPointer,
-    _snapshot: Snapshot,
-    _slot: *mut TupleTableSlot,
-    _call_again: *mut bool,
-    _all_dead: *mut bool,
+    scan: *mut IndexFetchTableData,
+    tid: ItemPointer,
+    snapshot: Snapshot,
+    slot: *mut TupleTableSlot,
+    call_again: *mut bool,
+    all_dead: *mut bool,
 ) -> bool {
-    todo!("index_fetch_tuple")
+    let hscan: *mut IndexFetchHeapData = scan.cast();
+    let bslot: *mut BufferHeapTupleTableSlot = slot.cast();
+    if !*call_again {
+        let prev_buf = (*hscan).xs_cbuf;
+        (*hscan).xs_cbuf = ReleaseAndReadBuffer(
+            (*hscan).xs_cbuf,
+            (*hscan).xs_base.rel,
+            ItemPointerGetBlockNumber(tid),
+        );
+
+        if prev_buf != (*hscan).xs_cbuf {
+            heap_page_prune_opt((*hscan).xs_base.rel, (*hscan).xs_cbuf);
+        }
+    }
+
+    LockBuffer((*hscan).xs_cbuf, BUFFER_LOCK_SHARE as i32);
+    // TODO: implement this function
+    let got_tuple = heap_hot_search_buffer(
+        tid,
+        (*hscan).xs_base.rel,
+        (*hscan).xs_cbuf,
+        snapshot,
+        &raw mut (*bslot).base.tupdata,
+        all_dead,
+        !*call_again,
+    );
+
+    (*bslot).base.tupdata.t_self = *tid;
+    LockBuffer((*hscan).xs_cbuf, BUFFER_LOCK_UNLOCK as i32);
+    *call_again = if got_tuple {
+        (*slot).tts_tableOid = RelationGetRelId!((*scan).rel);
+        ExecStoreBufferHeapTuple(&raw mut (*bslot).base.tupdata, slot, (*hscan).xs_cbuf);
+        !IsMVCCSnapshot!(snapshot)
+    } else {
+        false
+    };
+
+    got_tuple
 }
 
 #[pg_guard]
