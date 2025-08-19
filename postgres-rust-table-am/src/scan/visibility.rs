@@ -1,20 +1,22 @@
 use crate::include::general::Assert;
 use pg_sys::SnapshotType::*;
 use pg_sys::{
-    Buffer, BufferIsPermanent, HeapTuple, HeapTupleGetUpdateXid, HeapTupleHeaderGetCmax,
-    HeapTupleHeaderGetCmin, HeapTupleHeaderGetRawXmin, HeapTupleHeaderXminInvalid, InvalidOid,
-    ItemPointerIsValid, MarkBufferDirtyHint, Snapshot, TransactionIdDidCommit,
-    TransactionIdFollowsOrEquals, TransactionIdGetCommitLSN, TransactionIdIsCurrentTransactionId,
-    XidInMVCCSnapshot,
+    Buffer, BufferGetLSNAtomic, BufferIsPermanent, HeapTuple, HeapTupleGetUpdateXid,
+    HeapTupleHeaderData, HeapTupleHeaderGetCmax, HeapTupleHeaderGetCmin, HeapTupleHeaderGetRawXmin,
+    HeapTupleHeaderXminInvalid, HistoricSnapshotGetTupleCids, InvalidOid,
+    ItemPointerGetBlockNumber, ItemPointerGetBlockNumberNoCheck, ItemPointerIsValid,
+    MarkBufferDirtyHint, ResolveCminCmaxDuringDecoding, Snapshot, TransactionId,
+    TransactionIdDidCommit, TransactionIdFollowsOrEquals, TransactionIdGetCommitLSN,
+    TransactionIdIsCurrentTransactionId, TransactionIdIsInProgress, TransactionIdPrecedes,
+    XLogNeedsFlush, XidInMVCCSnapshot,
 };
 use pgrx::pg_sys::{
-    BufferGetLSNAtomic, HistoricSnapshotGetTupleCids, InvalidCommandId,
-    ResolveCminCmaxDuringDecoding, TransactionId, TransactionIdPrecedes, XLogNeedsFlush,
-    HEAP_LOCK_MASK, HEAP_MOVED_IN, HEAP_MOVED_OFF, HEAP_XMAX_COMMITTED, HEAP_XMAX_EXCL_LOCK,
-    HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMAX_LOCK_ONLY, HEAP_XMIN_COMMITTED,
-    HEAP_XMIN_FROZEN, HEAP_XMIN_INVALID,
+    InvalidCommandId, InvalidTransactionId, SpecTokenOffsetNumber, HEAP_LOCK_MASK, HEAP_MOVED_IN,
+    HEAP_MOVED_OFF, HEAP_XMAX_COMMITTED, HEAP_XMAX_EXCL_LOCK, HEAP_XMAX_INVALID,
+    HEAP_XMAX_IS_MULTI, HEAP_XMAX_LOCK_ONLY, HEAP_XMIN_COMMITTED, HEAP_XMIN_FROZEN,
+    HEAP_XMIN_INVALID,
 };
-use pgrx::{pg_sys::HeapTupleHeaderData, prelude::*};
+use pgrx::prelude::*;
 use std::slice::from_raw_parts_mut;
 
 #[pg_guard]
@@ -308,6 +310,283 @@ pub unsafe extern "C-unwind" fn tuple_satisfies_historic_mvcc(
 }
 
 #[pg_guard]
+pub unsafe extern "C-unwind" fn tuple_satisfies_dirty(
+    htup: HeapTuple,
+    snapshot: Snapshot,
+    buffer: Buffer,
+) -> bool {
+    let tuple = (*htup).t_data;
+    (*snapshot).xmin = InvalidTransactionId;
+    (*snapshot).xmax = InvalidTransactionId;
+    (*snapshot).speculativeToken = 0;
+    if !HeapTupleHeaderXminCommited(tuple) {
+        if HeapTupleHeaderXminInvalid(tuple) {
+            return false;
+        }
+
+        if (*tuple).t_infomask & HEAP_MOVED_OFF as u16 != 0 {
+        } else if (*tuple).t_infomask & HEAP_MOVED_IN as u16 != 0 {
+        } else if TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmin(tuple)) {
+            if (*tuple).t_infomask & HEAP_XMAX_INVALID as u16 != 0 {
+                return true;
+            }
+
+            if xmax_is_locked_only((*tuple).t_infomask) {
+                return true;
+            }
+
+            if (*tuple).t_infomask & HEAP_XMAX_IS_MULTI as u16 != 0 {
+                let xmax = HeapTupleGetUpdateXid(tuple);
+                return if !TransactionIdIsCurrentTransactionId(xmax) {
+                    true
+                } else {
+                    false
+                };
+            }
+
+            if !TransactionIdIsCurrentTransactionId((*tuple).t_choice.t_heap.t_xmax) {
+                SetHintBits(
+                    tuple,
+                    buffer,
+                    HEAP_XMAX_INVALID as u16,
+                    InvalidTransactionId,
+                );
+                return true;
+            }
+            return false;
+        } else if TransactionIdIsInProgress(HeapTupleHeaderGetRawXmin(tuple)) {
+            if ItemPointerGetBlockNumberNoCheck(&raw const (*tuple).t_ctid) == SpecTokenOffsetNumber
+            {
+                (*snapshot).speculativeToken =
+                    ItemPointerGetBlockNumber(&raw const (*tuple).t_ctid);
+            }
+
+            (*snapshot).xmin = HeapTupleHeaderGetRawXmin(tuple);
+            return true;
+        } else if TransactionIdDidCommit(HeapTupleHeaderGetRawXmin(tuple)) {
+            SetHintBits(
+                tuple,
+                buffer,
+                HEAP_XMIN_COMMITTED as u16,
+                HeapTupleHeaderGetRawXmin(tuple),
+            );
+        } else {
+            SetHintBits(
+                tuple,
+                buffer,
+                HEAP_XMIN_INVALID as u16,
+                InvalidTransactionId,
+            );
+            return false;
+        }
+    }
+
+    if (*tuple).t_infomask & HEAP_XMAX_INVALID as u16 != 0 {
+        return true;
+    }
+
+    if (*tuple).t_infomask & HEAP_XMAX_COMMITTED as u16 != 0 {
+        return if xmax_is_locked_only((*tuple).t_infomask) {
+            true
+        } else {
+            false
+        };
+    }
+
+    if (*tuple).t_infomask & HEAP_XMAX_IS_MULTI as u16 != 0 {
+        if xmax_is_locked_only((*tuple).t_infomask) {
+            return true;
+        }
+
+        let xmax = HeapTupleGetUpdateXid(tuple);
+        if TransactionIdIsCurrentTransactionId(xmax) {
+            return false;
+        }
+
+        if TransactionIdIsInProgress(xmax) {
+            (*snapshot).xmax = xmax;
+            return true;
+        }
+
+        if TransactionIdDidCommit(xmax) {
+            return false;
+        }
+
+        return true;
+    }
+
+    if TransactionIdIsCurrentTransactionId((*tuple).t_choice.t_heap.t_xmax) {
+        return if xmax_is_locked_only((*tuple).t_infomask) {
+            true
+        } else {
+            false
+        };
+    }
+
+    if TransactionIdIsInProgress((*tuple).t_choice.t_heap.t_xmax) {
+        if xmax_is_locked_only((*tuple).t_infomask) {
+            (*snapshot).xmax = (*tuple).t_choice.t_heap.t_xmax;
+        }
+
+        return true;
+    }
+
+    if !TransactionIdDidCommit((*tuple).t_choice.t_heap.t_xmax) {
+        SetHintBits(
+            tuple,
+            buffer,
+            HEAP_XMAX_INVALID as u16,
+            InvalidTransactionId,
+        );
+        return true;
+    }
+
+    SetHintBits(
+        tuple,
+        buffer,
+        HEAP_XMAX_COMMITTED as u16,
+        (*tuple).t_choice.t_heap.t_xmax,
+    );
+    false
+}
+
+#[pg_guard]
+// TODO: complete this function
+pub unsafe extern "C-unwind" fn tuple_satisfies_self(
+    htup: HeapTuple,
+    _snapshot: Snapshot,
+    buffer: Buffer,
+) -> bool {
+    let tuple = (*htup).t_data;
+    if !HeapTupleHeaderXminCommited(tuple) {
+        if HeapTupleHeaderXminInvalid(tuple) {
+            return false;
+        }
+
+        if (*tuple).t_infomask & HEAP_MOVED_OFF as u16 != 0 {
+        } else if (*tuple).t_infomask & HEAP_MOVED_IN as u16 != 0 {
+        } else if TransactionIdIsCurrentTransactionId(HeapTupleHeaderGetRawXmin(tuple)) {
+            if (*tuple).t_infomask & HEAP_XMAX_INVALID as u16 != 0 {
+                return true;
+            }
+
+            if xmax_is_locked_only((*tuple).t_infomask) {
+                return true;
+            }
+
+            if (*tuple).t_infomask & HEAP_XMAX_IS_MULTI as u16 != 0 {
+                let xmax = HeapTupleGetUpdateXid(tuple);
+                return if !TransactionIdIsCurrentTransactionId(xmax) {
+                    true
+                } else {
+                    false
+                };
+            }
+
+            if !TransactionIdIsCurrentTransactionId((*tuple).t_choice.t_heap.t_xmax) {
+                SetHintBits(
+                    tuple,
+                    buffer,
+                    HEAP_XMAX_INVALID as u16,
+                    InvalidTransactionId,
+                );
+                return true;
+            }
+            return false;
+        } else if TransactionIdIsInProgress(HeapTupleHeaderGetRawXmin(tuple)) {
+            return false;
+        } else if TransactionIdDidCommit(HeapTupleHeaderGetRawXmin(tuple)) {
+            SetHintBits(
+                tuple,
+                buffer,
+                HEAP_XMIN_COMMITTED as u16,
+                HeapTupleHeaderGetRawXmin(tuple),
+            );
+        } else {
+            SetHintBits(
+                tuple,
+                buffer,
+                HEAP_XMIN_INVALID as u16,
+                InvalidTransactionId,
+            );
+            return false;
+        }
+    }
+
+    if (*tuple).t_infomask & HEAP_XMAX_INVALID as u16 != 0 {
+        return true;
+    }
+
+    if (*tuple).t_infomask & HEAP_XMAX_COMMITTED as u16 != 0 {
+        return if xmax_is_locked_only((*tuple).t_infomask) {
+            true
+        } else {
+            false
+        };
+    }
+
+    if (*tuple).t_infomask & HEAP_XMAX_IS_MULTI as u16 != 0 {
+        if xmax_is_locked_only((*tuple).t_infomask) {
+            return true;
+        }
+
+        let xmax = HeapTupleGetUpdateXid(tuple);
+        if TransactionIdIsCurrentTransactionId(xmax) {
+            return false;
+        }
+
+        if TransactionIdIsInProgress(xmax) {
+            return true;
+        }
+
+        if TransactionIdDidCommit(xmax) {
+            return false;
+        }
+
+        return true;
+    }
+
+    if TransactionIdIsCurrentTransactionId((*tuple).t_choice.t_heap.t_xmax) {
+        if xmax_is_locked_only((*tuple).t_infomask) {
+            return true;
+        }
+        return false;
+    }
+
+    if TransactionIdIsInProgress((*tuple).t_choice.t_heap.t_xmax) {
+        return true;
+    }
+
+    if !TransactionIdDidCommit((*tuple).t_choice.t_heap.t_xmax) {
+        SetHintBits(
+            tuple,
+            buffer,
+            HEAP_XMAX_INVALID as u16,
+            InvalidTransactionId,
+        );
+        return true;
+    }
+
+    if xmax_is_locked_only((*tuple).t_infomask) {
+        SetHintBits(
+            tuple,
+            buffer,
+            HEAP_XMAX_INVALID as u16,
+            InvalidTransactionId,
+        );
+        return true;
+    }
+
+    SetHintBits(
+        tuple,
+        buffer,
+        HEAP_XMAX_COMMITTED as u16,
+        (*tuple).t_choice.t_heap.t_xmax,
+    );
+    false
+}
+
+#[pg_guard]
 pub unsafe extern "C-unwind" fn tuple_satisfies_visibility(
     htup: HeapTuple,
     snapshot: Snapshot,
@@ -315,10 +594,12 @@ pub unsafe extern "C-unwind" fn tuple_satisfies_visibility(
 ) -> bool {
     match (*snapshot).snapshot_type {
         SNAPSHOT_MVCC => tuple_satisfies_mvcc(htup, snapshot, buffer),
-        SNAPSHOT_SELF => todo!(""),
+        // called from search_buffer
+        SNAPSHOT_SELF => tuple_satisfies_self(htup, snapshot, buffer),
         SNAPSHOT_ANY => true,
         SNAPSHOT_TOAST => todo!(""),
-        SNAPSHOT_DIRTY => todo!(""),
+        // called from search_buffer
+        SNAPSHOT_DIRTY => tuple_satisfies_dirty(htup, snapshot, buffer),
         SNAPSHOT_HISTORIC_MVCC => tuple_satisfies_historic_mvcc(htup, snapshot, buffer),
         SNAPSHOT_NON_VACUUMABLE => todo!(""),
         _ => false,

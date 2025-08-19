@@ -6,26 +6,27 @@ use crate::insert::*;
 use crate::scan::fetcher::{heap_gettup, heap_gettup_pagemode};
 use crate::scan::visibility::*;
 use crate::scan::*;
-use crate::update::{fetch_tuple, tuple_update};
+use crate::update::{fetch_tuple, tuple_update, PredicateLockTID};
 
 // import types
 use pg_sys::{
-    BlockNumber, BufferAccessStrategy, BufferHeapTupleTableSlot, BulkInsertStateData, CommandId,
-    ForkNumber, ForkNumber::*, HeapScanDesc, HeapScanDescData, HeapTupleData, IndexBuildCallback,
-    IndexFetchTableData, IndexInfo, ItemPointer, LockTupleMode, LockWaitPolicy, MultiXactId, Oid,
-    ParallelBlockTableScanDesc, ParallelBlockTableScanWorkerData, ParallelTableScanDesc,
-    ParallelTableScanDescData, ReadStream, ReadStreamBlockNumberCB, RelFileLocator, Relation,
-    RelationData, SampleScanState, ScanDirection, ScanKey, ScanKeyData, Snapshot, SnapshotData,
-    TM_FailureData, TM_IndexDeleteOp, TM_Result, TU_UpdateIndexes, TableScanDesc, TransactionId,
-    TupleTableSlot, TupleTableSlotOps, VacuumParams, ValidateIndexState,
+    BlockNumber, Buffer, BufferAccessStrategy, BufferHeapTupleTableSlot, BulkInsertStateData,
+    CommandId, ForkNumber, ForkNumber::*, GlobalVisState, HeapScanDesc, HeapScanDescData,
+    HeapTupleData, IndexBuildCallback, IndexFetchTableData, IndexInfo, ItemPointer, LockTupleMode,
+    LockWaitPolicy, MultiXactId, Oid, ParallelBlockTableScanDesc, ParallelBlockTableScanWorkerData,
+    ParallelTableScanDesc, ParallelTableScanDescData, ReadStream, ReadStreamBlockNumberCB,
+    RelFileLocator, Relation, RelationData, SampleScanState, ScanDirection, ScanKey, ScanKeyData,
+    Snapshot, SnapshotData, TM_FailureData, TM_IndexDeleteOp, TM_Result, TU_UpdateIndexes,
+    TableScanDesc, TransactionId, TupleTableSlot, TupleTableSlotOps, VacuumParams,
+    ValidateIndexState,
 };
 
 // import constants
 use pg_sys::{
-    InvalidBuffer, InvalidCommandId, InvalidTransactionId, Mode, TTSOpsBufferHeapTuple, BLCKSZ,
-    BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK, HEAP_HOT_UPDATED, HEAP_KEYS_UPDATED, HEAP_MOVED,
-    HEAP_XMAX_BITS, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, READ_STREAM_SEQUENTIAL,
-    VISIBILITYMAP_VALID_BITS,
+    FirstOffsetNumber, InvalidBuffer, InvalidCommandId, InvalidTransactionId, Mode,
+    TTSOpsBufferHeapTuple, BLCKSZ, BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_UNLOCK, HEAP_HOT_UPDATED,
+    HEAP_KEYS_UPDATED, HEAP_MOVED, HEAP_XMAX_BITS, HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI,
+    LP_REDIRECT, READ_STREAM_SEQUENTIAL, VISIBILITYMAP_VALID_BITS,
 };
 
 use pgrx::pg_sys::LockTupleMode::LockTupleExclusive;
@@ -35,8 +36,9 @@ use pgrx::pg_sys::ScanDirection::ForwardScanDirection;
 use pgrx::pg_sys::TU_UpdateIndexes::{TU_All, TU_None, TU_Summarizing};
 use pgrx::pg_sys::XLTW_Oper::XLTW_Delete;
 use pgrx::pg_sys::{
-    bsysscan, heap_hot_search_buffer, heap_page_prune_opt, palloc0, CheckXidAlive, HTSV_Result::*,
-    IndexFetchHeapData, ReleaseAndReadBuffer,
+    bsysscan, heap_hot_search_buffer, heap_page_prune_opt, palloc0, CheckXidAlive,
+    GlobalVisTestFor, HTSV_Result::*, HeapTupleIsSurelyDead, IndexFetchHeapData,
+    ItemPointerSetOffsetNumber, PageGetMaxOffsetNumber, ReleaseAndReadBuffer,
 };
 use pgrx::pg_sys::{
     heap_get_root_tuples, heap_setscanlimits, table_endscan, table_slot_create, BlockIdData,
@@ -288,6 +290,99 @@ unsafe extern "C-unwind" fn index_fetch_end(scan: *mut IndexFetchTableData) {
 }
 
 #[pg_guard]
+unsafe extern "C-unwind" fn search_buffer(
+    tid: ItemPointer,
+    rel: *mut RelationData,
+    buffer: Buffer,
+    snapshot: *mut SnapshotData,
+    heap_tuple: *mut HeapTupleData,
+    all_dead: *mut bool,
+    fst_call: bool,
+) -> bool {
+    let page = BufferGetPage(buffer);
+    let mut prev_xmax = InvalidTransactionId;
+    let mut vistest: *mut GlobalVisState = std::ptr::null_mut();
+
+    if !all_dead.is_null() {
+        *all_dead = fst_call;
+    }
+
+    let (block_n, mut offnum) = (
+        ItemPointerGetBlockNumber(tid),
+        ItemPointerGetOffsetNumber(tid),
+    );
+
+    let mut at_chain_start = fst_call;
+    let mut skip = !fst_call;
+    loop {
+        if offnum < FirstOffsetNumber || offnum > PageGetMaxOffsetNumber(page) {
+            break;
+        }
+
+        let lp = PageGetItemId(page, offnum);
+        if !ItemIdIsNormal!(lp) {
+            // aka LP_REDIRECT
+            if (*lp).lp_flags() == LP_REDIRECT && at_chain_start {
+                offnum = (*lp).lp_off() as u16;
+                at_chain_start = false;
+                continue;
+            }
+            break;
+        }
+
+        (*heap_tuple).t_data = PageGetItem(page, lp).cast();
+        (*heap_tuple).t_len = (*lp).lp_len();
+        (*heap_tuple).t_tableOid = RelationGetRelId!(rel);
+        ItemPointerSet(&raw mut (*heap_tuple).t_self, block_n, offnum);
+
+        if at_chain_start && HeapTupleHeaderIsHeapOnly((*heap_tuple).t_data) {
+            break;
+        }
+
+        if prev_xmax != 0.into() && prev_xmax != HeapTupleHeaderGetXmin((*heap_tuple).t_data) {
+            break;
+        }
+
+        if !skip {
+            let valid = tuple_satisfies_visibility(heap_tuple, snapshot, buffer);
+            if valid {
+                ItemPointerSetOffsetNumber(tid, offnum);
+                PredicateLockTID(
+                    rel,
+                    &raw mut (*heap_tuple).t_self,
+                    snapshot,
+                    HeapTupleHeaderGetXmin((*heap_tuple).t_data),
+                );
+                if !all_dead.is_null() {
+                    *all_dead = false;
+                }
+                return true;
+            }
+        }
+
+        skip = false;
+        if !all_dead.is_null() && *all_dead {
+            if vistest.is_null() {
+                vistest = GlobalVisTestFor(rel);
+            }
+
+            if !HeapTupleIsSurelyDead(heap_tuple, vistest) {
+                *all_dead = false;
+            }
+        }
+
+        if HeapTupleHeaderIsHotUpdated((*heap_tuple).t_data) {
+            offnum = ItemPointerGetOffsetNumber(&raw const (*(*heap_tuple).t_data).t_ctid);
+            at_chain_start = false;
+            prev_xmax = tuple_header_get_update_xid((*heap_tuple).t_data);
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+#[pg_guard]
 unsafe extern "C-unwind" fn index_fetch_tuple(
     scan: *mut IndexFetchTableData,
     tid: ItemPointer,
@@ -313,7 +408,8 @@ unsafe extern "C-unwind" fn index_fetch_tuple(
 
     LockBuffer((*hscan).xs_cbuf, BUFFER_LOCK_SHARE as i32);
     // TODO: implement this function
-    let got_tuple = heap_hot_search_buffer(
+    // let got_tuple = heap_hot_search_buffer(
+    let got_tuple = search_buffer(
         tid,
         (*hscan).xs_base.rel,
         (*hscan).xs_cbuf,
@@ -667,7 +763,7 @@ unsafe extern "C-unwind" fn rsam_tuple_update(
     otid: ItemPointer,
     slot: *mut TupleTableSlot,
     cid: CommandId,
-    snapshot: Snapshot,
+    _snapshot: Snapshot,
     crosscheck: Snapshot,
     wait: bool,
     tmfd: *mut TM_FailureData,
