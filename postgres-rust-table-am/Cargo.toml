@@ -24,12 +24,12 @@ pg17 = ["pgrx/pg17", "pgrx-tests/pg17"]
 pg_test = []
 
 [dependencies]
-pgrx = "0.15.0"
-pgrx-sql-entity-graph = "0.15.0"
+pgrx = "0.16.1"
+pgrx-sql-entity-graph = "0.16.1"
 libc = "0.2.174"
 
 [dev-dependencies]
-pgrx-tests = "0.15.0"
+pgrx-tests = "0.16.1"
 
 [profile.dev]
 panic = "unwind"
