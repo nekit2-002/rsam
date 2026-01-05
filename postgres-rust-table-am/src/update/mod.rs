@@ -1,33 +1,34 @@
 use pgrx::pg_sys::{
     bms_add_member, bms_add_members, bms_free, bms_next_member, bms_overlap, heap_getattr, pfree,
-    pgstat_count_heap_update, varattrib_1b, varlena, visibilitymap_clear, visibilitymap_pin,
-    BufferGetBlockNumber, BufferGetPage, BufferIsValid, ConditionalXactLockTableWait, Datum,
-    DatumGetObjectId, DatumGetPointer, DoLockModesConflict, FirstLowInvalidHeapAttributeNumber,
-    FirstOffsetNumber, FormData_pg_attribute, GetCurrentTransactionId, GetMultiXactIdMembers,
-    HeapTupleGetUpdateXid, HeapTupleHeaderAdjustCmax, HeapTupleHeaderGetCmax,
-    HeapTupleHeaderGetNatts, HeapTupleSatisfiesUpdate, IsInParallelMode, ItemPointerEquals,
-    ItemPointerGetBlockNumber, ItemPointerGetOffsetNumber, ItemPointerIsValid, LockBuffer,
-    MarkBufferDirty, MultiXactIdSetOldestMember, PageClearAllVisible, PageGetHeapFreeSpace,
-    PageGetItem, PageGetItemId, PageGetMaxOffsetNumber, PageIsAllVisible, PageSetFull, ReadBuffer,
-    RelationGetIndexAttrBitmap, RelationSupportsSysCache, ReleaseBuffer, TableOidAttributeNumber,
-    TransactionIdDidAbort, TransactionIdIsCurrentTransactionId, TransactionIdIsInProgress,
-    TupleDesc, UnlockReleaseBuffer, UnlockTuple, XactLockTableWait, MAXALIGN,
+    pgstat_count_heap_update, visibilitymap_clear, visibilitymap_pin, BufferGetBlockNumber,
+    BufferGetPage, BufferIsValid, ConditionalXactLockTableWait, DoLockModesConflict,
+    GetCurrentTransactionId, GetMultiXactIdMembers, HeapTupleGetUpdateXid,
+    HeapTupleHeaderAdjustCmax, HeapTupleHeaderGetCmax, HeapTupleHeaderGetNatts,
+    HeapTupleSatisfiesUpdate, IsInParallelMode, ItemPointerEquals, ItemPointerGetBlockNumber,
+    ItemPointerGetOffsetNumber, ItemPointerIsValid, LockBuffer, MarkBufferDirty,
+    MultiXactIdSetOldestMember, PageClearAllVisible, PageGetHeapFreeSpace, PageGetItem,
+    PageGetItemId, PageGetMaxOffsetNumber, PageIsAllVisible, PageSetFull, ReadBuffer,
+    RelationGetIndexAttrBitmap, RelationSupportsSysCache, ReleaseBuffer, TransactionIdDidAbort,
+    TransactionIdIsCurrentTransactionId, TransactionIdIsInProgress, UnlockReleaseBuffer,
+    UnlockTuple, XactLockTableWait, MAXALIGN,
 };
 use pgrx::pg_sys::{
-    Bitmapset, Buffer, CommandId, HeapTuple, HeapTupleData, IndexAttrBitmapKind::*, ItemPointer,
-    LockTupleMode, LockTupleMode::*, MultiXactId, MultiXactStatus, MultiXactStatus::*, Relation,
-    Snapshot, TM_FailureData, TM_Result, TM_Result::*, TU_UpdateIndexes, TU_UpdateIndexes::*,
-    TransactionId, XLTW_Oper, XLTW_Oper::*, LOCKMODE,
+    Bitmapset, Buffer, CommandId, FormData_pg_attribute, HeapTuple, HeapTupleData,
+    IndexAttrBitmapKind::*, ItemPointer, LockTupleMode, LockTupleMode::*, MultiXactId,
+    MultiXactStatus, MultiXactStatus::*, Relation, Snapshot, TM_FailureData, TM_Result,
+    TM_Result::*, TU_UpdateIndexes, TU_UpdateIndexes::*, TransactionId, TupleDesc, XLTW_Oper,
+    XLTW_Oper::*, LOCKMODE,
 };
 use pgrx::pg_sys::{
-    InvalidBuffer, InvalidCommandId, InvalidTransactionId, BUFFER_LOCK_EXCLUSIVE,
-    BUFFER_LOCK_SHARE, BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK, HEAP_HOT_UPDATED, HEAP_KEYS_UPDATED,
-    HEAP_MOVED, HEAP_ONLY_TUPLE, HEAP_UPDATED, HEAP_XACT_MASK, HEAP_XMAX_BITS, HEAP_XMAX_INVALID,
-    HEAP_XMAX_IS_MULTI, HEAP_XMAX_KEYSHR_LOCK, HEAP_XMAX_LOCK_ONLY, VISIBILITYMAP_VALID_BITS,
+    FirstLowInvalidHeapAttributeNumber, FirstOffsetNumber, InvalidBuffer, InvalidCommandId,
+    InvalidTransactionId, TableOidAttributeNumber, BUFFER_LOCK_EXCLUSIVE, BUFFER_LOCK_SHARE,
+    BUFFER_LOCK_UNLOCK, HEAP2_XACT_MASK, HEAP_HOT_UPDATED, HEAP_KEYS_UPDATED, HEAP_MOVED,
+    HEAP_ONLY_TUPLE, HEAP_UPDATED, HEAP_XACT_MASK, HEAP_XMAX_BITS, HEAP_XMAX_INVALID,
+    HEAP_XMAX_IS_MULTI, HEAP_XMAX_KEYSHR_LOCK, HEAP_XMAX_LOCK_ONLY, VISIBILITYMAP_ALL_FROZEN,
+    VISIBILITYMAP_VALID_BITS,
 };
 
 use pgrx::pg_sys::LockWaitPolicy::LockWaitBlock;
-use pgrx::pg_sys::VISIBILITYMAP_ALL_FROZEN;
 use pgrx::prelude::*;
 use std::slice::from_raw_parts_mut;
 
